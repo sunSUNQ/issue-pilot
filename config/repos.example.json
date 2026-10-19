@@ -1,0 +1,20 @@
+{
+  "issueRepository": "YOUR_GITHUB_LOGIN/issue-pilot",
+  "worktreeRoot": "D:\\tasco-temp\\issue-pilot\\worktrees",
+  "repositories": {
+    "tasco": {
+      "path": "C:\\path\\to\\tasco",
+      "github": "YOUR_GITHUB_LOGIN/tasco",
+      "base": "main",
+      "policy": "tasco",
+      "checks": []
+    },
+    "codegraph": {
+      "path": "C:\\path\\to\\codegraph",
+      "github": "YOUR_GITHUB_LOGIN/codegraph",
+      "base": "main",
+      "policy": "codegraph",
+      "checks": []
+    }
+  }
+}

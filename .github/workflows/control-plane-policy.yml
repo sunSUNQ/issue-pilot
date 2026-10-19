@@ -1,0 +1,26 @@
+name: control-plane-policy
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an issue reference and validation section
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          if ! grep -Eqi '(^|[[:space:]])(refs|fixes|closes)[[:space:]]+(#[0-9]+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+)' <<<"$PR_BODY"; then
+            echo "PR must reference an Issue with Refs/Fixes/Closes." >&2
+            exit 1
+          fi
+          if ! grep -q '## 验证' <<<"$PR_BODY"; then
+            echo "PR must keep the 验证 section." >&2
+            exit 1
+          fi

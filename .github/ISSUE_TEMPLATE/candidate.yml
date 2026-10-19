@@ -1,0 +1,50 @@
+name: 候选事项
+description: 提交一个有证据、可证伪的新任务候选
+title: "[候选] "
+labels: ["status:candidate"]
+body:
+  - type: dropdown
+    id: repository
+    attributes:
+      label: 目标研发线
+      options: [tasco, codegraph, issue-pilot, cross-repo]
+    validations:
+      required: true
+  - type: dropdown
+    id: type
+    attributes:
+      label: 类型
+      options: [bug, maintenance, research, feature, decision]
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 观察证据
+      description: 提供可复现事实，而不是只有解决方案猜测。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: falsification
+    attributes:
+      label: 反例与失败条件
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 允许修改范围
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收方式
+    validations:
+      required: true
