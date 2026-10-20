@@ -148,3 +148,31 @@ export function ensurePathOnD(target) {
     fail(`临时/worktree 路径必须在 D 盘：${target}`);
   }
 }
+
+export function soloMode() {
+  const file = path.join(root, 'policies', 'solo-mode.md');
+  if (!fs.existsSync(file)) return { enabled: false, phase: 'absent' };
+  const head = fs.readFileSync(file, 'utf8').split(/\r?\n/).slice(0, 4).join('\n');
+  if (head.includes('> 状态：**ACTIVE')) return { enabled: true, phase: 'active' };
+  if (head.includes('> 状态：**PILOT')) return { enabled: true, phase: 'pilot' };
+  return { enabled: false, phase: 'draft' };
+}
+
+export function statePath(config, alias, number) {
+  return path.join(root, 'config', 'state', `${alias}-${number}.json`);
+}
+
+export function loadState(config, alias, number) {
+  const file = statePath(config, alias, number);
+  if (!fs.existsSync(file)) return {};
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+export function saveState(config, alias, number, patch) {
+  const file = statePath(config, alias, number);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const current = loadState(config, alias, number);
+  const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+  fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  return next;
+}

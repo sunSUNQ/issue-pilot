@@ -17,6 +17,15 @@ candidate -> needs-triage -> needs-owner -> approved
           -> in-progress -> in-review -> verified -> closed
 ```
 
+## Solo Mode（policies/solo-mode.md）
+
+单人开发自治模式：`advance`/`autopilot` 自动推进 candidate → approved →
+实现 → PR → 复审 → merge → verify → close。AUTO 清单（bug/maintenance/
+research + 五要素 + 查重 + policy 范围）外的任务、Owner Gate 文件命中、
+失败超阈值一律 hold 升级。phase=DRAFT 时全部自动路径拒绝；PILOT 仅限
+清单内 Issue；ACTIVE 需 Owner 一次性启用授权。Agent 不得修改 policy
+扩大自身权限。
+
 ## 行动标签（need:*）
 
 每个 open Issue 恰有一个 `need:*` 标签，指向下一步行动者；`brief` 按
