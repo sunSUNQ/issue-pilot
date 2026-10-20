@@ -432,8 +432,8 @@ function autoMerge(config, item, alias, repo, state) {
   const pr = findPr(config, repo, branch);
   if (!pr) return '未找到开放 PR';
   if (pr.state !== 'OPEN') return `PR #${pr.number} 状态 ${pr.state}`;
-  const head = run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
-    '--json', 'headRefOid']).stdout;
+  const head = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
+    '--json', 'headRefOid']).stdout).headRefOid;
   if (state.head && state.head !== head) {
     return `state HEAD ${state.head.slice(0, 8)} != PR head ${head.slice(0, 8)}（新 commit 需重审）`;
   }

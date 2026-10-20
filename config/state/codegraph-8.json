@@ -1,4 +1,8 @@
 {
   "autoApproveBlock": "查重命中其他开放 Issue（关键词：重载调用点 signature 展示口径观察记录）",
-  "updatedAt": "2026-10-20T07:06:33.708Z"
+  "updatedAt": "2026-10-20T07:08:41.906Z",
+  "prUrl": "https://github.com/sunSUNQ/provenlattice/pull/17",
+  "head": "59cabb16d6aa1b8ef06a26b4fd6027294c2b7bc9",
+  "branch": "issue-pilot/8-research-java-signature",
+  "submittedAt": "2026-10-20T07:08:41.906Z"
 }
