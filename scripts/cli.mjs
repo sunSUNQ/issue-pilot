@@ -328,25 +328,32 @@ function comment(config, number, body) {
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
 }
 
+function titleTokens(title) {
+  return new Set((title.replace(/^[a-z]+\([^)]*\):\s*/, '')
+    .match(/[A-Za-z0-9]+|[\u4e00-\u9fff]{2,}/g) ?? []));
+}
+
 function autoApprove(config, item) {
   const number = item.number;
   const type = typeOf(item);
   if (!AUTO_TYPES.has(type)) return `类型 ${type} 不在 AUTO 清单（bug/maintenance/research）`;
   const missing = AUTO_ELEMENTS.filter((key) => !(item.body ?? '').includes(key));
   if (missing.length) return `正文缺少提案要素：${missing.join('、')}`;
-  const titleKey = item.title.replace(/^[a-z]+\([^)]*\):\s*/, '').slice(0, 24);
-  const others = run('gh', ['issue', 'list', '-R', config.issueRepository,
-    '--state', 'open', '--search', titleKey, '--limit', '20'], { allowFailure: true });
-  const duplicate = (others.stdout.match(/#(\d+)/g) ?? [])
-    .some((tag) => Number(tag.slice(1)) !== number);
-  if (duplicate) return `查重命中其他开放 Issue（关键词：${titleKey}）`;
+  const tokens = titleTokens(item.title);
+  const open = JSON.parse(run('gh', ['issue', 'list', '-R', config.issueRepository,
+    '--state', 'open', '--limit', '100', '--json', 'number,title']).stdout);
+  const duplicate = open.filter((other) => other.number !== number).some((other) => {
+    const shared = [...tokens].filter((token) => titleTokens(other.title).has(token));
+    return tokens.size > 0 && shared.length / tokens.size >= 0.6;
+  });
+  if (duplicate) return `查重命中其他开放 Issue（词元重叠 ≥60%）`;
   setStatus(config, number, 'approved');
   setNeed(config, number, 'author');
   comment(config, number, [
     'Solo Mode 自动批准（AUTO）。',
     `- 类型 ${type} ∈ {bug, maintenance, research}`,
     '- 提案五要素完整：' + AUTO_ELEMENTS.join(' / '),
-    `- 查重无命中（关键词：${titleKey}）`,
+    `- 查重无命中（标题词元重叠 <60%，开放 Issue ${open.length - 1} 个比对）`,
     `- 依据 policies/codegraph.md 自动推进范围；phase=${soloMode().phase}`,
   ].join('\n'));
   console.log(`#${number} -> approved (solo auto)`);
