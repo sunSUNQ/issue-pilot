@@ -91,19 +91,23 @@ export function run(command, args = [], options = {}) {
     env: environment,
   });
   if (result.error) fail(`${command}: ${result.error.message}`);
-  if (result.status !== 0 && !options.allowFailure) {
+  if (result.status !== 0) {
     const output = `${result.stderr || ''}\n${result.stdout || ''}`;
     const rejected = /\b401\b|Bad credentials/i.test(output);
     if (command === 'gh' && process.env.PL_ENFORCE_APP === '1' && !options.noRetry401 && rejected) {
       const minted = mintAppToken(environment);
-      if (!minted.ok) fail(`gh 认证失败且 App token 重铸失败（fail-closed）：${minted.reason}`);
-      adoptMintedToken(minted);
-      const retryEnv = { ...(options.env ?? {}) };
-      delete retryEnv.GH_TOKEN;
-      delete retryEnv.PL_GIT_TOKEN;
-      return run(command, args, { ...options, noRetry401: true, env: retryEnv });
+      if (minted.ok) {
+        adoptMintedToken(minted);
+        const retryEnv = { ...(options.env ?? {}) };
+        delete retryEnv.GH_TOKEN;
+        delete retryEnv.PL_GIT_TOKEN;
+        return run(command, args, { ...options, noRetry401: true, env: retryEnv });
+      }
+      if (!options.allowFailure) fail(`gh 认证失败且 App token 重铸失败（fail-closed）：${minted.reason}`);
     }
-    fail((result.stderr || result.stdout || `${command} exited ${result.status}`).trim());
+    if (!options.allowFailure) {
+      fail((result.stderr || result.stdout || `${command} exited ${result.status}`).trim());
+    }
   }
   return { status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
 }
