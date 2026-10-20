@@ -128,6 +128,17 @@ export function setStatus(config, number, status) {
   run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`]);
 }
 
+export function setNeed(config, number, need) {
+  const current = issue(config, number);
+  const needs = labelsOf(current).filter((label) => label.startsWith('need:'));
+  for (const label of needs) {
+    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
+  }
+  if (need) {
+    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`]);
+  }
+}
+
 export function worktreePath(config, alias, number) {
   return path.resolve(config.worktreeRoot, `${alias}-${number}`);
 }

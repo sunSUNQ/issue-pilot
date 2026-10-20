@@ -17,6 +17,20 @@ candidate -> needs-triage -> needs-owner -> approved
           -> in-progress -> in-review -> verified -> closed
 ```
 
+## 行动标签（need:*）
+
+每个 open Issue 恰有一个 `need:*` 标签，指向下一步行动者；`brief` 按
+该标签分组。多窗口的 Agent 与 owner 按标签认领工作，不靠口头协调。
+
+- `need:owner`：等 owner（approve、merge、close、方向决策）。Agent 禁止代替执行。
+- `need:reviewer`：等独立复审。必须由未参与实现的 Agent 或人执行。
+- `need:author`：等实现者（开始实现、按 review 意见修复）。Agent 可认领。
+
+标签由 CLI 在状态转换时自动维护：propose→owner、approve→author、
+run→author、submit→reviewer、review lgtm→owner、review changes→author、
+verify→owner、close→清除。手工改标签只应用于与上述转换等价的情况，
+并在 Issue 评论中说明原因。
+
 - Agent 可以自主创建 `candidate`，但必须先查重并提供可证伪的依据。
 - 只有人类 owner 可以执行 `approve`。Agent 禁止代替 owner 批准自己的提议。
 - 未经批准只能调查和补充 Issue，不得修改产品代码。

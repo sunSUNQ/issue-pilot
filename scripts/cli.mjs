@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   ensurePathOnD, fail, issue, labelsOf, loadConfig, parseArgs, repoAliasOf,
-  root, run, runShell, setStatus, slugify, worktreePath,
+  root, run, runShell, setNeed, setStatus, slugify, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -15,6 +15,7 @@ const TYPE_COLORS = {
   bug: 'D73A4A', maintenance: 'C5DEF5', research: '7057FF',
   feature: 'A2EEEF', decision: 'F9D0C4',
 };
+const NEED_COLORS = { author: 'FBCA04', reviewer: '1D76DB', owner: 'D93F0B' };
 
 function usage() {
   console.log(`Issue Pilot
@@ -32,6 +33,9 @@ function usage() {
   review <issue> --verdict <lgtm|changes> --sha <commit>
   verify <issue> --evidence-file <path>
   close <issue> --summary-file <path>
+
+Labels: status:* lifecycle · type:* kind · need:* next actor
+(author / reviewer / owner). brief groups by need:*.
 
 Owner-only: approve, merge, release. Agent-created work starts as candidate.`);
 }
@@ -71,6 +75,7 @@ function setup(config) {
   const labels = [
     ...Object.entries(STATUS_COLORS).map(([name, color]) => [`status:${name}`, color]),
     ...Object.entries(TYPE_COLORS).map(([name, color]) => [`type:${name}`, color]),
+    ...Object.entries(NEED_COLORS).map(([name, color]) => [`need:${name}`, color]),
     ...Object.keys(config.repositories).map((name) => [`repo:${name}`, 'D4C5F9']),
     ['review:lgtm', '0E8A16'], ['preflight', 'FEF2C0'],
   ];
@@ -85,18 +90,21 @@ function brief(config, mine) {
   const args = ['issue', 'list', '-R', config.issueRepository, '--state', 'open', '--limit', '100', '--json', fields];
   if (mine) args.push('--assignee', '@me');
   const issues = JSON.parse(run('gh', args).stdout);
-  const order = ['needs-owner', 'in-review', 'in-progress', 'approved', 'needs-triage', 'candidate', 'blocked'];
+  const order = ['need:owner', 'need:reviewer', 'need:author', 'other'];
   const groups = new Map(order.map((status) => [status, []]));
   for (const item of issues) {
-    const status = labelsOf(item).find((label) => label.startsWith('status:'))?.slice(7) ?? 'candidate';
-    if (!groups.has(status)) groups.set(status, []);
-    groups.get(status).push(item);
+    const need = labelsOf(item).find((label) => label.startsWith('need:')) ?? 'other';
+    if (!groups.has(need)) groups.set(need, []);
+    groups.get(need).push(item);
   }
   if (!issues.length) return console.log('没有未关闭的 Issue。');
-  for (const [status, items] of groups) {
+  for (const [group, items] of groups) {
     if (!items.length) continue;
-    console.log(`\n## ${status} (${items.length})`);
-    for (const item of items) console.log(`- #${item.number} ${item.title}  ${item.url}`);
+    console.log(`\n## ${group} (${items.length})`);
+    for (const item of items) {
+      const status = labelsOf(item).find((label) => label.startsWith('status:'))?.slice(7) ?? 'candidate';
+      console.log(`- #${item.number} [${status}] ${item.title}  ${item.url}`);
+    }
   }
 }
 
@@ -146,6 +154,7 @@ function propose(config, flags) {
     'issue', 'create', '-R', config.issueRepository, '--title', title,
     '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo}`,
   ]);
+  setNeed(config, Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0), 'owner');
   console.log(result.stdout);
 }
 
@@ -153,6 +162,7 @@ function approve(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') fail(`Issue #${number} 不是 OPEN。`);
   setStatus(config, number, 'approved');
+  setNeed(config, number, 'author');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', 'Owner gate：批准进入实现。']);
   console.log(`#${number} -> approved`);
 }
@@ -171,6 +181,7 @@ function startRun(config, number) {
   const start = remoteBase.status === 0 ? `origin/${repo.base}` : repo.base;
   run('git', ['-C', repo.path, 'worktree', 'add', '-b', branch, target, start]);
   setStatus(config, number, 'in-progress');
+  setNeed(config, number, 'author');
   const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\``;
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
   console.log(target);
@@ -207,6 +218,7 @@ function submit(config, number) {
     '--title', item.title.replace(/^\[候选\]\s*/, ''), '--body', body,
   ]).stdout;
   setStatus(config, number, 'in-review');
+  setNeed(config, number, 'reviewer');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `PR 已提交：${pr}`]);
   console.log(pr);
 }
@@ -222,9 +234,11 @@ function review(config, number, flags) {
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
   if (flags.verdict === 'lgtm') {
     run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', 'review:lgtm']);
+    setNeed(config, number, 'owner');
   } else {
     run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { allowFailure: true });
     setStatus(config, number, 'in-progress');
+    setNeed(config, number, 'author');
   }
 }
 
@@ -237,6 +251,7 @@ function verify(config, number, flags) {
   const evidence = fs.readFileSync(evidencePath, 'utf8');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}`]);
   setStatus(config, number, 'verified');
+  setNeed(config, number, 'owner');
   console.log(`#${number} -> verified`);
 }
 
@@ -248,6 +263,7 @@ function closeIssue(config, number, flags) {
   if (!labelsOf(item).includes('status:verified')) fail(`#${number} 尚未完成 verified Gate。`);
   const summary = fs.readFileSync(summaryPath, 'utf8');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}`]);
+  setNeed(config, number, null);
   run('gh', ['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
   console.log(`#${number} closed`);
 }
