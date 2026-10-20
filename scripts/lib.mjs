@@ -9,31 +9,79 @@ export function fail(message) {
   throw new Error(message);
 }
 
-export function parseGitCredential(text) {
-  const credential = {};
-  for (const line of text.split(/\r?\n/)) {
-    const separator = line.indexOf('=');
-    if (separator > 0) credential[line.slice(0, separator)] = line.slice(separator + 1);
+export const TOKEN_RENEW_MARGIN_MS = 10 * 60 * 1000;
+
+// App-only token policy (R16). The control plane never reads Git Credential
+// Manager and never injects OAuth credentials. Under PL_ENFORCE_APP=1 (set by
+// the role launchers) a missing/expiring/invalid installation token is renewed
+// from the pinned PEM or the command fails closed.
+export function tokenState(env, now = Date.now()) {
+  if (env.PL_ENFORCE_APP !== '1') return { enforced: false, action: 'passthrough' };
+  for (const key of ['PL_APP_ID', 'PL_APP_INSTALLATION_ID', 'PL_APP_KEY_PATH']) {
+    if (!env[key]) return { enforced: true, action: 'fail', reason: `PL_ENFORCE_APP=1 但缺少 ${key}（fail-closed）` };
   }
-  return credential;
+  if (!env.GH_TOKEN) return { enforced: true, action: 'renew', reason: 'GH_TOKEN 缺失' };
+  const expiresAt = Date.parse(env.PL_TOKEN_EXPIRES_AT ?? '');
+  if (!Number.isFinite(expiresAt)) return { enforced: true, action: 'renew', reason: 'PL_TOKEN_EXPIRES_AT 缺失或非法' };
+  if (expiresAt - now < TOKEN_RENEW_MARGIN_MS) {
+    return { enforced: true, action: 'renew', reason: `token 将在 ${Math.max(0, Math.round((expiresAt - now) / 60000))} 分钟内到期` };
+  }
+  return { enforced: true, action: 'ok', expiresAt };
 }
 
-function ghEnvironment(baseEnv) {
-  if (baseEnv.GH_TOKEN || baseEnv.GITHUB_TOKEN) return baseEnv;
-  const credentialResult = spawnSync('git', ['credential', 'fill'], {
+function tokenScript() {
+  return path.join(root, 'scripts', 'pl-token.mjs');
+}
+
+export function mintAppToken(baseEnv) {
+  const result = spawnSync(process.execPath, [tokenScript()], {
     encoding: 'utf8',
-    input: 'protocol=https\nhost=github.com\n\n',
     windowsHide: true,
     env: baseEnv,
   });
-  if (credentialResult.status !== 0) return baseEnv;
-  const credential = parseGitCredential(credentialResult.stdout);
-  return credential.password ? { ...baseEnv, GH_TOKEN: credential.password } : baseEnv;
+  if (result.status !== 0) {
+    return { ok: false, reason: (result.stderr || `exit ${result.status}`).trim() };
+  }
+  let minted;
+  try {
+    minted = JSON.parse(result.stdout);
+  } catch {
+    return { ok: false, reason: 'mint output not parseable（stdout withheld）' };
+  }
+  return {
+    ok: true,
+    env: {
+      ...baseEnv,
+      GH_TOKEN: minted.token,
+      PL_GIT_TOKEN: minted.token,
+      PL_TOKEN_EXPIRES_AT: minted.expiresAt,
+      PL_TOKEN_BOT: minted.bot,
+    },
+    expiresAt: minted.expiresAt,
+    bot: minted.bot,
+  };
+}
+
+function adoptMintedToken(minted) {
+  process.env.GH_TOKEN = minted.env.GH_TOKEN;
+  process.env.PL_GIT_TOKEN = minted.env.PL_GIT_TOKEN;
+  process.env.PL_TOKEN_EXPIRES_AT = minted.env.PL_TOKEN_EXPIRES_AT;
+  process.env.PL_TOKEN_BOT = minted.env.PL_TOKEN_BOT;
+}
+
+function ghTokenEnvironment(baseEnv) {
+  const state = tokenState(baseEnv);
+  if (!state.enforced || state.action === 'ok') return baseEnv;
+  if (state.action === 'fail') fail(state.reason);
+  const minted = mintAppToken(baseEnv);
+  if (!minted.ok) fail(`App token 续签失败（fail-closed，不回退 OAuth）：${minted.reason}`);
+  adoptMintedToken(minted);
+  return minted.env;
 }
 
 export function run(command, args = [], options = {}) {
   let environment = { ...process.env, ...(options.env ?? {}) };
-  if (command === 'gh') environment = ghEnvironment(environment);
+  if (command === 'gh') environment = ghTokenEnvironment(environment);
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? root,
     encoding: 'utf8',
@@ -44,6 +92,17 @@ export function run(command, args = [], options = {}) {
   });
   if (result.error) fail(`${command}: ${result.error.message}`);
   if (result.status !== 0 && !options.allowFailure) {
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`;
+    const rejected = /\b401\b|Bad credentials/i.test(output);
+    if (command === 'gh' && process.env.PL_ENFORCE_APP === '1' && !options.noRetry401 && rejected) {
+      const minted = mintAppToken(environment);
+      if (!minted.ok) fail(`gh 认证失败且 App token 重铸失败（fail-closed）：${minted.reason}`);
+      adoptMintedToken(minted);
+      const retryEnv = { ...(options.env ?? {}) };
+      delete retryEnv.GH_TOKEN;
+      delete retryEnv.PL_GIT_TOKEN;
+      return run(command, args, { ...options, noRetry401: true, env: retryEnv });
+    }
     fail((result.stderr || result.stdout || `${command} exited ${result.status}`).trim());
   }
   return { status: result.status, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
