@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { labelsOf, parseArgs, slugify } from '../scripts/lib.mjs';
+import { labelsOf, parseArgs, parseGitCredential, slugify } from '../scripts/lib.mjs';
 
 test('parseArgs separates positionals and flags', () => {
   assert.deepEqual(
@@ -16,4 +16,11 @@ test('slugify produces bounded branch-safe names', () => {
 
 test('labelsOf accepts GitHub label objects', () => {
   assert.deepEqual(labelsOf({ labels: [{ name: 'status:approved' }, { name: 'repo:tasco' }] }), ['status:approved', 'repo:tasco']);
+});
+
+test('parseGitCredential preserves equals signs inside tokens', () => {
+  assert.deepEqual(
+    parseGitCredential('protocol=https\r\nhost=github.com\r\nusername=user\r\npassword=a=b=c\r\n'),
+    { protocol: 'https', host: 'github.com', username: 'user', password: 'a=b=c' },
+  );
 });

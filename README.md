@@ -24,10 +24,13 @@ Agent evidence
 
 - Node.js >= 22.18
 - Git
-- GitHub CLI `gh`，已登录具备目标仓库权限的账号
+- GitHub CLI `gh`；支持 `gh auth` 或 Git Credential Manager 中已有的 GitHub 登录
 - Windows 上存在 `D:\tasco-temp\`；所有 worktree 和临时产物都写 D 盘
 
 不需要安装 npm 依赖。
+
+当 `gh` 自身 token 过期、但 Git push 仍可用时，CLI 会从 Git Credential Manager
+读取当前 GitHub 凭据，仅注入当前 `gh` 子进程；不会打印或写入仓库配置。
 
 ## 首次启用
 

@@ -9,14 +9,38 @@ export function fail(message) {
   throw new Error(message);
 }
 
+export function parseGitCredential(text) {
+  const credential = {};
+  for (const line of text.split(/\r?\n/)) {
+    const separator = line.indexOf('=');
+    if (separator > 0) credential[line.slice(0, separator)] = line.slice(separator + 1);
+  }
+  return credential;
+}
+
+function ghEnvironment(baseEnv) {
+  if (baseEnv.GH_TOKEN || baseEnv.GITHUB_TOKEN) return baseEnv;
+  const credentialResult = spawnSync('git', ['credential', 'fill'], {
+    encoding: 'utf8',
+    input: 'protocol=https\nhost=github.com\n\n',
+    windowsHide: true,
+    env: baseEnv,
+  });
+  if (credentialResult.status !== 0) return baseEnv;
+  const credential = parseGitCredential(credentialResult.stdout);
+  return credential.password ? { ...baseEnv, GH_TOKEN: credential.password } : baseEnv;
+}
+
 export function run(command, args = [], options = {}) {
+  let environment = { ...process.env, ...(options.env ?? {}) };
+  if (command === 'gh') environment = ghEnvironment(environment);
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? root,
     encoding: 'utf8',
     input: options.input,
     shell: false,
     windowsHide: true,
-    env: { ...process.env, ...(options.env ?? {}) },
+    env: environment,
   });
   if (result.error) fail(`${command}: ${result.error.message}`);
   if (result.status !== 0 && !options.allowFailure) {
