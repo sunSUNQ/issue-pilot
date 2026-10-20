@@ -100,8 +100,16 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 
 ## 8. 受控试运行（Step 4）
 
-5 个低风险 Issue（P1 重载 signature 观察、P2 stage0 同步〔预期 gate/hold〕、
-P3 验证 fixture 反例、P4 defect-guide 状态同步、P5 版本号变更〔预期 gate 拦截〕），
+试运行 Issue 清单（PILOT 阶段仅限此清单，代码级强制 `PILOT_ISSUES`）：
+
+| # | Issue | 验证点 |
+|---|---|---|
+| P1 | #8 重载 signature 观察记录 | 自动批准→实现→PR→merge→close 全链 |
+| P2 | #9 stage0 状态行同步 | 无进展停止 + owner 升级（文件不在 base） |
+| P3 | #10 fixture 解析错误反例 | 代码类实现 + 验证器扩展 |
+| P4 | #11 报告数字精确化 | docs-only 修复轮 |
+| P5 | #12 版本号预备 | Owner Gate 拦截（pyproject 命中 → hold） |
+
 验证：自动批准、派发、独立复审、修复重审、CI 门、自动合并、关闭、
 gate 拦截、中断恢复。不得降低检查条件换取 PASS。
 

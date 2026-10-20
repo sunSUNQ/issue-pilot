@@ -300,6 +300,7 @@ const WORKFLOW_ALLOWED = new Set(['.github/workflows/ci.yml']);
 const WORKFLOW_FORBIDDEN_ADDED = ['permissions:', 'secrets', /^on:/];
 const HOLD_REVIEW_CHANGES = 2;
 const HOLD_CI_FAILURES = 2;
+const PILOT_ISSUES = new Set([8, 9, 10, 11, 12]);
 
 function requireSolo() {
   const solo = soloMode();
@@ -521,6 +522,9 @@ function autoClose(config, item, alias) {
 
 function advanceOnce(config, number) {
   const solo = requireSolo();
+  if (solo.phase === 'pilot' && !PILOT_ISSUES.has(number)) {
+    return { progress: false, reason: `PILOT 阶段仅限试运行清单 ${[...PILOT_ISSUES].join('/')}` };
+  }
   const item = issue(config, number);
   if (item.state !== 'OPEN') return { progress: false, reason: 'closed' };
   const alias = repoAliasOf(item, config);
