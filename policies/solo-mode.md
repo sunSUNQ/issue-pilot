@@ -5,6 +5,15 @@
 > 生效范围：`repo:codegraph`（sunSUNQ/provenlattice）；`repo:tasco` 暂不启用。
 > 工单：PL-ISSUE-PILOT-SOLO-MODE-V1 · 本文件与 AGENTS.md 冲突时，以 AGENTS.md
 > 的 Owner Gate 条款为准。
+> 安全门：G1 = **G1_SINGLE_USER_APP_SCOPED_OPERATION**（单 Windows 用户 + 双 GitHub App
+> 角色专属认证）。凭据边界 = App 级身份隔离（GitHub 强制）+ 进程级凭据作用域 + 纪律与
+> 审计；**不含操作系统级强隔离**。同用户进程互读 PEM/环境变量并冒用身份的残余风险
+> （RA-1/RA-7，未消除，仅可审计检测）由 Owner 签署接受（签署记录：
+> reports/activation-v1/owner-signature-record.md，2026-10-21）。运行前提：GitHub
+> 凭据一律经 `launchers/start-<role>-agent.ps1` 注入（App-only、fail-closed、自动续签、
+> 身份钉扎）；GitHub 强制 Review/CI 与全部 Owner Gate（发布、版本、Formal 等）不变；
+> Owner 可随时暂停任一 GitHub App installation 以撤销相应 Agent 的全部令牌。
+> 本合同验收完成前 SECURITY_HOLD 维持。
 
 ## 1. 目标
 

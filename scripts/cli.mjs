@@ -61,9 +61,24 @@ function doctor(config) {
     console.log(`${ok ? 'PASS' : 'FAIL'} ${command} ${ok ? result.stdout.split('\n')[0] : result.stderr}`);
     bad ||= !ok;
   }
-  const auth = run('gh', ['auth', 'status'], { allowFailure: true });
+  const auth = run('gh', ['api', 'rate_limit'], { allowFailure: true });
   console.log(`${auth.status === 0 ? 'PASS' : 'FAIL'} GitHub auth`);
   bad ||= auth.status !== 0;
+  if (process.env.PL_ENFORCE_APP === '1') {
+    let login = '';
+    let expected = process.env.PL_TOKEN_BOT || process.env.PL_EXPECTED_BOT || '';
+    const viewer = run('gh', ['api', 'graphql', '-f', 'query=query{viewer{login}}'], { allowFailure: true });
+    if (viewer.status === 0) {
+      try { login = JSON.parse(viewer.stdout).data.viewer.login; } catch { login = ''; }
+    }
+    const identityOk = login !== '' && (!expected || login === expected);
+    console.log(`${identityOk ? 'PASS' : 'FAIL'} PL identity: ${login || '(lookup failed)'}${expected ? ` (expected ${expected})` : ' (no PL expectation set)'}`);
+    bad ||= !identityOk;
+    const expiresAt = Date.parse(process.env.PL_TOKEN_EXPIRES_AT ?? '');
+    if (Number.isFinite(expiresAt)) {
+      console.log(`INFO PL token expires_at ${new Date(expiresAt).toISOString()}`);
+    }
+  }
   for (const [alias, repo] of Object.entries(config.repositories)) {
     const exists = fs.existsSync(repo.path);
     const git = exists && run('git', ['-C', repo.path, 'rev-parse', '--is-inside-work-tree'], { allowFailure: true }).status === 0;
