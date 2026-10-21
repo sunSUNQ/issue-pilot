@@ -1,7 +1,8 @@
 # Solo Mode Policy V1（单人开发自治模式）
 
-> 状态：**PILOT — 受控试运行中（仅限试运行 Issue 清单 §8）；持续自动合并未启用，
-> 待 Owner 对最终自治权限配置一次性批准后改为 ACTIVE**
+> 状态：**ACTIVE — 单用户双 App 模式运行中（Owner 于 2026-10-21 独立批准启用，
+> 首个真实任务 issue-pilot#15）。安全门、Owner Gate、Review/CI/Ruleset 与审计全部
+> 保留；AUTO 推进按 §3/§5 质量门执行**
 > 生效范围：`repo:codegraph`（sunSUNQ/provenlattice）；`repo:tasco` 暂不启用。
 > 工单：PL-ISSUE-PILOT-SOLO-MODE-V1 · 本文件与 AGENTS.md 冲突时，以 AGENTS.md
 > 的 Owner Gate 条款为准。
