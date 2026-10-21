@@ -71,6 +71,9 @@ verify→owner、close→清除。手工改标签只应用于与上述转换等�
 5. PR review 必须由未参与实现的 Agent 或人完成。
 6. 有修改意见时回到 `in-progress`；新 commit 使旧 review 失效。
 7. 合并后必须记录验证证据并进入 `verified`，才能总结关闭。
+8. GitHub 凭据一律经 `launchers/start-<role>-agent.ps1` 注入（App-only、fail-closed、
+   自动续签、身份钉扎）；未经 launcher 验证的会话不得执行需要 GitHub 写权限的操作；
+   身份与续签留痕写入 state 文件与 Issue 评论（不含任何令牌值）。
 
 ## 写入与安全边界
 
