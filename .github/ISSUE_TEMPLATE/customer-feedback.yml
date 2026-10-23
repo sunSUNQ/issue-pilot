@@ -1,0 +1,39 @@
+name: 客户反馈
+description: 报告 ProvenLattice 试用中的问题或改进建议（统一回流 issue-pilot）
+title: "[feedback] "
+labels: ["GRAPH_BUG"]
+body:
+  - type: dropdown
+    id: category
+    attributes:
+      label: 反馈分类
+      description: 由 Owner 决定是否进入 Roadmap。
+      options:
+        - Graph Coverage（缺少关系）
+        - Graph Correctness（关系错误）
+        - Graph Precision（关系过粗）
+        - Query Usability（已有图难以直接消费）
+        - Scale / Performance（性能或资源问题）
+        - Installation / Integration（安装 / 集成）
+    validations:
+      required: true
+  - type: textarea
+    id: observation
+    attributes:
+      label: 现象
+      description: 版本、仓库、命令、期望 vs 实际（可复现事实优先）。
+    validations:
+      required: true
+  - type: textarea
+    id: expectation
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响
+      description: 这个反馈对实际使用的影响程度。
+    validations:
+      required: false
