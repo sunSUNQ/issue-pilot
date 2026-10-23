@@ -3,7 +3,11 @@
 Issue Pilot 是 owner-governed 的研发控制平面。Issue 保存变化中的任务、讨论、
 决策和进度；产品仓库只保存代码与必要文档；PR 是唯一代码交付路径。
 
-issue-pilot 也是 ProvenLattice 的图谱能力研发任务池：第一优先级是持续增加和改进
+issue-pilot 是 ProvenLattice 的唯一任务控制面（control plane）：ProvenLattice
+仅作为执行面（execution plane）承接代码、测试、PR、CI 和 Release，不承担独立
+Roadmap 与任务规划；见 `policies/control-plane.md`。
+
+issue-pilot 同时是 ProvenLattice 的图谱能力研发任务池：第一优先级是持续增加和改进
 图谱能力并尽快交付真实客户，改进方向主要由客户使用反馈驱动；图谱能力研发遵循
 `policies/graph-capabilities.md`。
 
@@ -86,6 +90,23 @@ Roadmap 由 Owner 控制（policies/graph-capabilities.md §3）；Agent 可提�
 不得自行调整优先级或自动启动下一项开发。禁止：将普通 Feature 自动升级为研究项目、
 拆分大量 Readiness/Closure Issue、验收通过后继续自动开展 Formal、以"缺少完美验证"
 阻止功能进入 main、自行扩大 Roadmap、为理论完整性无限增加能力范围。
+
+## 单一控制面（policies/control-plane.md）
+
+issue-pilot 是唯一任务控制面，ProvenLattice 是执行面。所有新的 ProvenLattice 工作
+默认先在 issue-pilot 创建 Issue（类型 GRAPH_FEATURE / GRAPH_QUERY / GRAPH_BUG /
+GRAPH_SCALE / INTEGRATION；Research 须 Owner 单独授权），不得在 ProvenLattice
+自行创建产品方向或 Roadmap Issue。
+
+Source of Truth 分离：issue-pilot 持有 Roadmap / Priority / scope / acceptance /
+Owner decisions / Blocked / Customer feedback / completion；ProvenLattice 持有
+code / tests / PR / CI / merge / release。ProvenLattice PR 是执行产物，非任务规划源。
+
+ProvenLattice Issue 仅限：公开客户 Bug、需要 GitHub 原生公开跟踪、第三方贡献者
+参与、Release blocker、Owner 明确要求；否则仅用 issue-pilot Issue + PR。
+
+禁止双轨管理：两套 Roadmap、同一功能两仓库重复维护完整 Issue、ProvenLattice Issue
+改变已批准 scope、实现中自行扩大 Roadmap、PR 合并后因未来增强项不关闭原 Issue。
 
 ## 提议质量门
 
