@@ -37,27 +37,32 @@ Research Issue 默认不进入产品主线，必须有 Owner 单独授权。
 
 ## 3. Roadmap（Owner 控制的方向清单）
 
+已完成（进入 main）：Java Field Data Flow V1、Java Interprocedural
+Parameter / Return Data Flow V1。
+
+Owner 调整后的下一阶段优先级（2026-10-23）：
+
 ### P0
 
-1. Java Field Data Flow V1
-2. Java Interprocedural Parameter / Return Data Flow
-3. Def-Use Query API
+1. Def-Use / Dataflow Query API（get_definition / get_uses / get_dataflow_path / get_backward_slice 最小版）
+2. 跨文件 Interprocedural Data Flow（复用 CALLS resolution，替代短名唯一匹配）
 
 ### P1
 
-4. Lightweight Alias / Points-to
-5. Java Exception CFG
-6. Program Slice V1
+3. Lightweight Alias / Points-to（仅局部 assignment / parameter / return alias）
+4. Program Slice V1
 
 ### P2
+
+5. Java Exception CFG
+6. 更完整的 field / heap flow
+
+### 长期方向
 
 7. Interprocedural CFG
 8. Cross-function Slice
 9. Root-cause / Impact Query
 10. Source-Sink / Taint V1
-
-### 长期方向
-
 11. Python / C / C++ / Java 图能力逐步对齐
 12. Incremental Graph Update
 13. Large Repository Scale
