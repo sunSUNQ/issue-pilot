@@ -1,3 +1,19 @@
+## Roadmap Alignment
+
+<!-- 属于哪个已批准图谱能力方向（见 policies/graph-capabilities.md §3）。 -->
+
+## Product Value
+
+<!-- 完成后客户能够新增使用什么能力。 -->
+
+## Minimal Scope
+
+<!-- 最小可交付范围是什么。 -->
+
+## Necessity
+
+<!-- 必须创建新 Issue，还是属于当前 Issue 正常实现范围。 -->
+
 ## 观察证据
 
 <!-- 可复现事实、失败输出、遥测或文档冲突。 -->

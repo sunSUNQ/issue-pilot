@@ -14,7 +14,36 @@ body:
     id: type
     attributes:
       label: 类型
-      options: [bug, maintenance, research, feature, decision]
+      description: 图谱能力类型（GRAPH_* / INTEGRATION）为 ProvenLattice 主线；research 默认不进产品主线，须 Owner 单独授权。
+      options: [GRAPH_FEATURE, GRAPH_QUERY, GRAPH_BUG, GRAPH_SCALE, INTEGRATION, bug, maintenance, research, decision]
+    validations:
+      required: true
+  - type: textarea
+    id: roadmap_alignment
+    attributes:
+      label: Roadmap Alignment
+      description: 属于哪个已批准图谱能力方向（见 policies/graph-capabilities.md §3）。
+    validations:
+      required: true
+  - type: textarea
+    id: product_value
+    attributes:
+      label: Product Value
+      description: 完成后客户能够新增使用什么能力。
+    validations:
+      required: true
+  - type: textarea
+    id: minimal_scope
+    attributes:
+      label: Minimal Scope
+      description: 最小可交付范围是什么。
+    validations:
+      required: true
+  - type: textarea
+    id: necessity
+    attributes:
+      label: Necessity
+      description: 必须创建新 Issue，还是属于当前 Issue 正常实现范围。
     validations:
       required: true
   - type: textarea
