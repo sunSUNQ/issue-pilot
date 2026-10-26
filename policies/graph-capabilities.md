@@ -23,6 +23,25 @@ Evidence Closure、多模型 Judge、大规模实验。
 3. 高风险架构变更；
 4. Owner 明确批准的论文 / 研究任务。
 
+## 当前阶段（Phase）
+
+`CUSTOMER_FEEDBACK`（自 ProvenLattice 1.6.0 发布起，2026-10-23）。
+
+- v1.6.0 为当前稳定客户试用版本；
+- 不因内部实验 / benchmark / 验证 / 文档整理发布新版本；
+- 不主动继续扩展 Java 图谱能力；
+- 新能力优先由客户反馈或明确集成需求触发；
+- Bug / correctness 问题可进入维护流程；
+- capability gap 不自动等价于 Bug。
+
+### 下一版本触发规则
+
+下一版本不得仅由 benchmark / validation / experiment / documentation-only /
+capability review / 单纯测试数量增加触发；必须包含至少一个明确的新产品能力或
+具有用户价值的行为变化。候选（points-to / alias / cross-file interprocedural /
+signature-aware resolution）仅作候选，不自动立项。优先级来源：客户真实反馈 →
+集成方明确需求 → 高频 correctness 问题 → 多个反馈共同暴露的能力缺口。
+
 ## 2. Issue 类型（图谱能力）
 
 - `GRAPH_FEATURE`：新增图能力。如 Java Field Data Flow、Interprocedural Data Flow、

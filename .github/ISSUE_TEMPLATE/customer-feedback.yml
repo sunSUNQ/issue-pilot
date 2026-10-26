@@ -3,11 +3,18 @@ description: 报告 ProvenLattice 试用中的问题或改进建议（统一回�
 title: "[feedback] "
 labels: ["GRAPH_BUG"]
 body:
+  - type: input
+    id: version
+    attributes:
+      label: ProvenLattice version
+      description: 反馈对应的版本（reported-on）。
+      value: "1.6.0"
+    validations:
+      required: true
   - type: dropdown
     id: category
     attributes:
       label: 反馈分类
-      description: 由 Owner 决定是否进入 Roadmap。
       options:
         - Graph Coverage（缺少关系）
         - Graph Correctness（关系错误）
@@ -17,23 +24,57 @@ body:
         - Installation / Integration（安装 / 集成）
     validations:
       required: true
-  - type: textarea
-    id: observation
+  - type: dropdown
+    id: kind
     attributes:
-      label: 现象
-      description: 版本、仓库、命令、期望 vs 实际（可复现事实优先）。
+      label: 问题性质
+      options: [BUG, CAPABILITY_GAP, USABILITY, INTEGRATION]
+    validations:
+      required: true
+  - type: input
+    id: language
+    attributes:
+      label: language
+      description: Python / C / C++ / Java
+    validations:
+      required: false
+  - type: textarea
+    id: workload
+    attributes:
+      label: repository / workload
+    validations:
+      required: false
+  - type: textarea
+    id: actual
+    attributes:
+      label: actual behavior
+      description: 实际发生了什么（命令、输出、错误）。
     validations:
       required: true
   - type: textarea
-    id: expectation
+    id: expected
     attributes:
-      label: 期望行为
+      label: expected behavior
     validations:
       required: true
   - type: textarea
-    id: impact
+    id: reproduction
     attributes:
-      label: 影响
-      description: 这个反馈对实际使用的影响程度。
+      label: minimal reproduction
+      description: 最小复现（命令 + 输入片段）。
+    validations:
+      required: false
+  - type: input
+    id: affected
+    attributes:
+      label: affected query / capability
+      description: 例如 callers / sparse_dfg / analysis ...
+    validations:
+      required: false
+  - type: dropdown
+    id: severity
+    attributes:
+      label: severity
+      options: [critical, high, medium, low]
     validations:
       required: false
