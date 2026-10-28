@@ -2,9 +2,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState, parseArgs,
-  repoAliasOf, root, run, runShell, saveState, setNeed, setStatus, slugify,
-  soloMode, statePath, worktreePath,
+  AUTO_ELEMENTS, ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
+  missingAutoElements, parseArgs, repoAliasOf, root, run, runShell, saveState,
+  setNeed, setStatus, slugify, soloMode, statePath, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -307,7 +307,6 @@ function closeIssue(config, number, flags) {
 // ---------------------------------------------------------------------------
 
 const AUTO_TYPES = new Set(['bug', 'maintenance', 'research']);
-const AUTO_ELEMENTS = ['观察证据', '期望行为', '反例或失败条件', '允许修改范围', '验收方式'];
 const GATE_PREFIXES = ['policies/', 'config/', '.github/'];
 const GATE_FILES = new Set(['AGENTS.md', 'pyproject.toml', 'src/provenlattice/storage.py']);
 const GATE_DIFF_MARKERS = ['CREATE TABLE', 'ALTER TABLE', 'QUALIFIED'];
@@ -352,7 +351,7 @@ function autoApprove(config, item) {
   const number = item.number;
   const type = typeOf(item);
   if (!AUTO_TYPES.has(type)) return `类型 ${type} 不在 AUTO 清单（bug/maintenance/research）`;
-  const missing = AUTO_ELEMENTS.filter((key) => !(item.body ?? '').includes(key));
+  const missing = missingAutoElements(item.body);
   if (missing.length) return `正文缺少提案要素：${missing.join('、')}`;
   const tokens = titleTokens(item.title);
   const open = JSON.parse(run('gh', ['issue', 'list', '-R', config.issueRepository,
