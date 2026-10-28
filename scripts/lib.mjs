@@ -239,3 +239,19 @@ export function saveState(config, alias, number, patch) {
   fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
   return next;
 }
+
+export const AUTO_ELEMENTS = ['观察证据', '期望行为', '反例或失败条件', '允许修改范围', '验收方式'];
+
+// 反例要素兼容两种历史写法：模板 candidate.md / candidate.yml 用「反例与失败条件」，
+// AGENTS.md / AUTO_ELEMENTS 用「反例或失败条件」。二者等价通过，其余四要素精确匹配。
+export const AUTO_ELEMENT_ALTERNATIVES = {
+  '反例或失败条件': ['反例或失败条件', '反例与失败条件'],
+};
+
+export function missingAutoElements(body) {
+  const text = body ?? '';
+  return AUTO_ELEMENTS.filter((element) => {
+    const candidates = AUTO_ELEMENT_ALTERNATIVES[element] ?? [element];
+    return !candidates.some((candidate) => text.includes(candidate));
+  });
+}
