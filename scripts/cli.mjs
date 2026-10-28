@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  AUTO_ELEMENTS, ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
+  ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
   missingAutoElements, parseArgs, repoAliasOf, root, run, runShell, saveState,
   setNeed, setStatus, slugify, soloMode, statePath, worktreePath,
 } from './lib.mjs';
@@ -366,7 +366,7 @@ function autoApprove(config, item) {
   comment(config, number, [
     'Solo Mode 自动批准（AUTO）。',
     `- 类型 ${type} ∈ {bug, maintenance, research}`,
-    '- 提案五要素完整：' + AUTO_ELEMENTS.join(' / '),
+    '- 提案五要素完整：观察证据 / 期望行为 / 反例或失败条件 / 允许修改范围 / 验收方式',
     `- 查重无命中（标题词元重叠 <60%，开放 Issue ${open.length - 1} 个比对）`,
     `- 依据 policies/codegraph.md 自动推进范围；phase=${soloMode().phase}`,
   ].join('\n'));
