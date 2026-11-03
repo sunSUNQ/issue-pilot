@@ -43,4 +43,6 @@ FINAL_VERDICT=READY_FOR_OWNER_APPROVAL
 
 ## 4. Contract commit
 
-合同 commit 在冻结文件提交后记录到 Issue #39 评论；该评论必须同时声明 Master 未执行 approve。
+- Commit：`c102def1631a81c4f7afe1b84f144017bc77e215`（`docs: freeze SUB-03 R0 evidence schema`）
+- Files：`cwe1123_v2_query_contract.md`、`sub03_r0_schema_freeze_decision.md`、`sub03_owner_approval_readiness.md`
+- 已记录到 Issue #39 评论；该评论同时声明 Master 未执行 approve。

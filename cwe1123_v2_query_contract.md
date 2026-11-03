@@ -13,9 +13,9 @@
   - `graph_requirements_gap_matrix_v2.md`
   - `pl_graph_improvement_dependency_dag.md`、`pl_graph_improvement_wave_plan.md`、`pl_graph_improvement_sub_issue_matrix.md`
   - `pl_t01_implementation_contract_v1.md`（E-DEFECT 关联与 trace_evidence 链合同，已冻结）
-- 产品代码基线：`sunSUNQ/provenlattice` **v1.6.0 / `b6e656681da4c04d34a237b925176221129e0b24`**（`main`）。
-- 已落地 Wave 1 additive 字段（上下文，非本轮重冻）：`access_kind/is_write`（SUB-02/PR #45，merge `855b498`）、`trace_evidence/evidence_id`（SUB-01/PR #46，merge `7a6d602`）。
-- 冻结决策记录：`g0_partial_contract_freeze_decision.md`。
+- 产品代码基线：`sunSUNQ/provenlattice` v1.6.0 原始基线 `b6e656681da4c04d34a237b925176221129e0b24`；本文件冻结时 `main` 已含全部 5 个 producer merge，HEAD = `4a7ff06dcf492b5e8674a25a5b1bb8404ba8494e`（2026-11-03）。
+- 5 个 producer 已全部落地并 merge：SUB-01 `7a6d602`（PR #46）、SUB-02 `855b498`（PR #45）、SUB-04 `2abe216`（PR #48）、SUB-05 `4a7ff06`（PR #49）、SUB-06 `562c12a`（PR #47）。
+- 冻结决策记录：`g0_partial_contract_freeze_decision.md`、`sub03_r0_schema_freeze_decision.md`。
 
 ## 1. 范围与所有权
 
