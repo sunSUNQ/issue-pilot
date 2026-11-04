@@ -11,8 +11,8 @@ Owner 批准将 #43 正式实现拆为两个独立 Feature Sub-Issue：
 
 | Issue | 任务 | 类型 | 状态 | 依赖 |
 |---|---|---|---|---|
-| **#49** | S7-F1：THREAD_SPAWN 事实生产正式化 | `type:feature` | `approved` / `need:author` | #43 研究合同 |
-| **#48** | S7-F2：受限 DEREF_RESOLVES_TO 消费 + FIX-05 闭环 | `type:feature` | `blocked` / `need:owner` | **#49 verified/closed（硬前置）** |
+| **#49** | S7-F1：THREAD_SPAWN 事实生产正式化 | `type:feature` | **CLOSED · verified**（PR #51 @ `55ad30b`） | #43 研究合同 |
+| **#48** | S7-F2：受限 DEREF_RESOLVES_TO 消费 + FIX-05 闭环 | `type:feature` | `blocked` / `need:owner`（HOLD） | **#49 verified/closed（已满足）** + Owner 单独授权 |
 
 - #43 保持 `type:research / status:needs-owner / need:owner`，作为研究祖先，**不改为 feature-approved**。
 - S7-F1 / S7-F2 分别提交、独立 Review，不允许跨阶段偷跑（F1 未 merge 不得启动 F2 生产实现）。
@@ -23,8 +23,8 @@ Owner 批准将 #43 正式实现拆为两个独立 Feature Sub-Issue：
 FOUNDATION_VERIFIED = {#37, #38, #40, #41, #42}   #39 closed/verified
 
 #43 (SUB-07 research, type:research)  -- 研究祖先，保持 needs-owner
-  └─> #49 (S7-F1, feature, approved)  <- sub07_formal_implementation_contract.md @ c290e0e
-        └─> #48 (S7-F2, feature, blocked)  <- #49 verified/closed（硬前置）
+  └─> #49 (S7-F1, feature, CLOSED·verified)  <- merged PR #51 @ 55ad30b
+        └─> #48 (S7-F2, feature, blocked/HOLD)  <- #49 closed（已满足）+ Owner 单独授权
 
 #44 <- #48（SUB-07 正式可消费输出）+ THREAD_JOIN handle 事实 + 独立 Owner approval
 #45 <- #48（fp/identity 能力）+ call relation contract 冻结 + 独立近似分析 Owner approval
