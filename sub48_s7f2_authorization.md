@@ -52,9 +52,11 @@
 ## 6. 独立复审（非实现者）
 
 - 复审者：`pl-owner-reviewer[bot]`（App 身份，非实现 Worker / 非 Owner sunSUNQ）。
-- 结论：**LGTM**，commit `11b0b989fdd6cdabf0b17a04a616d49ded41b52d`（8 项审查点全 PASS）。
-- #48 现处于 `in-review` + `review:lgtm` + `need:owner`，等 Owner 决定 merge。
-- 非阻断观察（供 Owner 知悉）：
+- **状态已纠正（2026-11-04）**：首次 LGTM 由实现者在同一会话内 spawn 子代理代审，不构成
+  "未参与实现的独立 Reviewer" 复审，已按 Owner 指示撤销（移除 `review:lgtm` + `need:owner`，
+  恢复 `need:reviewer`）。PR #53 待**真正独立**的 Reviewer 复审。
+- 实现者不自审、不代审、不推进 need:owner；Merge 仍由 Owner 决策。
+- 非阻断观察（供后续独立 Reviewer 知悉）：
   - 模块为独立 query-time 模块，未接线到 `concurrency_profile.py`/`defect_query.py`
     （二者为 forbidden；FIX-05 same_storage=true 候选链在本模块边界演示，端到端接线留待后续）。
   - `_sole_param_name` 依赖单参签名最后一个空白 token；异常格式 → may 降级，永不误 must。
