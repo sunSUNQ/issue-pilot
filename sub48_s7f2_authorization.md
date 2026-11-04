@@ -52,11 +52,14 @@
 ## 6. 独立复审（非实现者）
 
 - 复审者：`pl-owner-reviewer[bot]`（App 身份，非实现 Worker / 非 Owner sunSUNQ）。
-- **状态已纠正（2026-11-04）**：首次 LGTM 由实现者在同一会话内 spawn 子代理代审，不构成
-  "未参与实现的独立 Reviewer" 复审，已按 Owner 指示撤销（移除 `review:lgtm` + `need:owner`，
-  恢复 `need:reviewer`）。PR #53 待**真正独立**的 Reviewer 复审。
-- 实现者不自审、不代审、不推进 need:owner；Merge 仍由 Owner 决策。
-- 非阻断观察（供后续独立 Reviewer 知悉）：
+- **最终状态（Owner 已裁定）**：03:15/03:16 的**真正独立** Reviewer（非我上一轮被撤销的自审子代理）
+  对 PR #53 复核通过 LGTM，代码满足 §1.5/§1.6/§1.7/§1.8 与 §2 S7-F2 全部要求；按状态机
+  `review lgtm→owner`，**#48 保持 `need:owner`**（接受独立 LGTM，不撤销）。
+- **Merge 被 §3 门 GATED**（该 review 明确标注）：§3 第 1 项（REAL_CORPUS_FP_FN）与第 2 项
+  （PERF_OVERHEAD）尚未产出，故 **Owner 须 Hold merge**，不得自动放行（合同 §0
+  `SUB07_MERGE_AUTHORIZED = NO` / `SUB07_DEFAULT_ENABLED = NO`）。
+- 实现者不自审、不代审、不 merge；Merge/Close 仍由 Owner 决策。
+- 独立 Review 观察（供 Owner 知悉）：
   - 模块为独立 query-time 模块，未接线到 `concurrency_profile.py`/`defect_query.py`
-    （二者为 forbidden；FIX-05 same_storage=true 候选链在本模块边界演示，端到端接线留待后续）。
+    （二者为 forbidden；FIX-05 same_storage=true 候选链在本模块边界演示，端到端接线留待后续 R3）。
   - `_sole_param_name` 依赖单参签名最后一个空白 token；异常格式 → may 降级，永不误 must。
