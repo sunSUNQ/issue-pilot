@@ -34,6 +34,7 @@ function usage() {
   submit <issue>
   ci <issue>
   review <issue> --verdict <lgtm|changes|blocked> --sha <commit> [--note <text>]
+  merge <issue> --verdict <merge|rework> [--reason <text>]
   verify <issue> --evidence-file <path>
   close <issue> --summary-file <path>
   advance <issue>       Solo Mode 幂等单步自动推进
@@ -483,6 +484,73 @@ function ci(config, number) {
   }
 }
 
+// 独立有效 LGTM：launcher_role=reviewer 且 reviewed_head_sha == headSha。
+// Repo Owner 自审（owner 角色）不满足 merge 独立性（Q3 铁律）。
+function validReviewerLgtm(state, headSha) {
+  const reviews = state.reviews ?? [];
+  return reviews.filter((r) =>
+    r.reviewer_verdict === 'lgtm' && r.launcher_role === 'reviewer' && r.reviewed_head_sha === headSha,
+  ).pop() ?? null;
+}
+
+// merge <issue> --verdict merge|rework — Repo Owner 唯一 merge 门（§5-9/§5-18）。
+function merge(config, number, flags) {
+  const verdict = flags.verdict;
+  if (!['merge', 'rework'].includes(verdict)) fail('--verdict 必须是 merge|rework。');
+  assertNoRoleOverride(flags);
+
+  // 1. 角色门：PL_ROLE=owner + PL_ENFORCE_APP=1（§5-18）
+  const identity = verifyLauncherIdentity(process.env);
+  if (identity.role !== 'owner') fail('merge 仅限 Repo Owner（PL_ROLE=owner）');
+
+  // 2. 读 issue + state
+  const item = issue(config, number);
+  const alias = repoAliasOf(item, config);
+  const repo = config.repositories[alias];
+  const state = loadState(config, alias, number);
+
+  // 3. PR + head
+  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
+  const pr = findPr(config, repo, branch);
+  if (!pr) fail('未找到开放 PR');
+  if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+  const headSha = pr.headRefOid;
+
+  // 4. 四门重检（HEAD==reviewed sha / Required Checks@head 全绿 / LGTM 有效 / gateAudit 0 命中）
+  const failures = [];
+  const lgtm = validReviewerLgtm(state, headSha);
+  if (!lgtm) failures.push(`无有效 reviewer LGTM（需 launcher_role=reviewer 且 reviewed_head_sha=${headSha.slice(0, 8)}）`);
+  const checks = canEnterReview(config, repo, repo.base, headSha);
+  if (!checks.ready) failures.push(`Required Checks @head 未全绿：${checks.missing.join('; ')}`);
+  const violations = gateAudit(config, repo, pr.number);
+  if (violations.length) failures.push(`Owner Gate 命中：${violations.join('; ')}`);
+
+  if (verdict === 'merge') {
+    if (failures.length) fail(`merge 四门重检失败：\n- ${failures.join('\n- ')}`);
+    run('gh', ['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
+    const merged = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
+      '--json', 'mergeCommit,state']).stdout);
+    const mergedSha = merged.mergeCommit?.oid ?? null;
+    saveState(config, alias, number, {
+      mergedSha, mergedAt: new Date().toISOString(),
+      mergeVerdict: 'merge', mergeLgtm: lgtm.review_id,
+    });
+    setStatus(config, number, 'verifying');
+    setNeed(config, number, 'issue-owner');
+    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}`]);
+    console.log(`#${number} merged -> verifying`);
+  } else {
+    const reason = failures.length ? failures.join('；') : (flags.reason || 'Repo Owner 退回');
+    saveState(config, alias, number, { mergeVerdict: 'rework', reworkAt: new Date().toISOString(), reworkReason: reason });
+    setStatus(config, number, 'in-progress');
+    setNeed(config, number, 'author');
+    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `Repo Owner 退回（rework）：\n\n${reason}`]);
+    console.log(`#${number} -> in-progress（rework）`);
+  }
+}
+
 function verify(config, number, flags) {
   if (!flags['evidence-file']) fail('verify 需要 --evidence-file。');
   const evidencePath = path.resolve(flags['evidence-file']);
@@ -521,8 +589,6 @@ const GATE_FILES = new Set(['AGENTS.md', 'pyproject.toml', 'src/provenlattice/st
 const GATE_DIFF_MARKERS = ['CREATE TABLE', 'ALTER TABLE', 'QUALIFIED'];
 const WORKFLOW_ALLOWED = new Set(['.github/workflows/ci.yml']);
 const WORKFLOW_FORBIDDEN_ADDED = ['permissions:', 'secrets', /^on:/];
-const HOLD_REVIEW_CHANGES = 2;
-const HOLD_CI_FAILURES = 2;
 const PILOT_ISSUES = new Set([8, 9, 10, 11, 12]);
 
 function requireSolo() {
@@ -590,26 +656,6 @@ function findPr(config, repo, branch) {
   return prs.find((pr) => pr.state === 'OPEN') ?? prs[0] ?? null;
 }
 
-function checksGreen(config, repo, prNumber) {
-  const out = run('gh', ['pr', 'checks', String(prNumber), '-R', repo.github],
-    { allowFailure: true });
-  const rows = (out.stdout || '').split(/\r?\n/).filter((line) => line.includes('\t'));
-  if (!rows.length) return { green: false, failed: true, detail: 'no checks reported' };
-  const detail = [];
-  let green = true;
-  let failed = false;
-  for (const row of rows) {
-    const [, status] = row.split('\t');
-    const state = (status ?? '').trim();
-    if (state !== 'pass' && state !== 'skipping') {
-      green = false;
-      if (state === 'fail') failed = true;
-    }
-    detail.push(`${state}: ${row.split('\t')[0]}`);
-  }
-  return { green, failed, detail: detail.join('; ') };
-}
-
 function gateAudit(config, repo, prNumber) {
   const files = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '-R', repo.github,
     '--json', 'files']).stdout).files;
@@ -639,68 +685,36 @@ function gateAudit(config, repo, prNumber) {
   return [...new Set(violations)];
 }
 
-function reviewLgtmSha(config, item) {
-  const comments = JSON.parse(run('gh', ['issue', 'view', String(item.number),
-    '-R', config.issueRepository, '--json', 'comments']).stdout).comments;
-  for (let i = comments.length - 1; i >= 0; i -= 1) {
-    const match = comments[i].body.match(/独立 review：LGTM，审查 commit `([0-9a-f]{7,40})`/);
-    if (match) return { sha: match[1], url: comments[i].url };
-  }
-  return null;
-}
-
 function autoMerge(config, item, alias, repo, state) {
   const number = item.number;
   const branch = `issue-pilot/${number}-${slugify(item.title)}`;
   const pr = findPr(config, repo, branch);
   if (!pr) return '未找到开放 PR';
   if (pr.state !== 'OPEN') return `PR #${pr.number} 状态 ${pr.state}`;
-  const head = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
-    '--json', 'headRefOid']).stdout).headRefOid;
+  const head = pr.headRefOid;
   if (state.head && state.head !== head) {
     return `state HEAD ${state.head.slice(0, 8)} != PR head ${head.slice(0, 8)}（新 commit 需重审）`;
   }
-  const review = reviewLgtmSha(config, item);
-  if (!review) return '尚无 LGTM review';
-  if (review.sha !== head.slice(0, review.sha.length)) {
-    return `LGTM SHA ${review.sha} != PR head ${head.slice(0, 8)}（新 commit 使复审失效）`;
-  }
-  if ((state.reviewChangesCount ?? 0) >= HOLD_REVIEW_CHANGES) {
-    hold(config, number, `复审 changes 达 ${state.reviewChangesCount} 轮`);
-    return 'held';
-  }
-  const checks = checksGreen(config, repo, pr.number);
-  if (!checks.green) {
-    const next = saveState(config, alias, number, {
-      ciFailCount: checks.failed ? (state.ciFailCount ?? 0) + 1 : (state.ciFailCount ?? 0),
-    });
-    if (checks.failed && next.ciFailCount >= HOLD_CI_FAILURES) {
-      hold(config, number, `CI 失败达 ${next.ciFailCount} 次`);
-      return 'held';
-    }
-    return `CI 未全绿：${checks.detail}`;
-  }
+  const lgtm = validReviewerLgtm(state, head);
+  if (!lgtm) return '尚无有效 reviewer LGTM（SHA 绑定）';
+  const checks = canEnterReview(config, repo, repo.base, head);
+  if (!checks.ready) return `CI 未全绿：${checks.missing.join('; ')}`;
   const violations = gateAudit(config, repo, pr.number);
   if (violations.length) {
     hold(config, number, `Owner Gate 命中：\n- ${violations.join('\n- ')}`);
     return 'held';
   }
-  run('gh', ['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
-  const merged = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
-    '--json', 'mergeCommit,state']).stdout);
-  saveState(config, alias, number, {
-    mergedSha: merged.mergeCommit?.oid ?? null, prUrl: pr.url,
-    head, gates: 'HEAD绑定/LGTM匹配/CI全绿/gate审计通过',
-  });
-  setStatus(config, number, 'verifying');
-  setNeed(config, number, 'author');
+  // 决策⑤（§5-13）：Solo Mode 到 merge 门即停，不自动 merge，置 need:repo-owner。
+  saveState(config, alias, number, { soloMergeGateReady: true, head });
+  setNeed(config, number, 'repo-owner');
   comment(config, number, [
-    `Solo Mode 自动合并：PR #${pr.number}`,
-    `- HEAD：\`${head.slice(0, 12)}\`；merge：\`${(merged.mergeCommit?.oid ?? '').slice(0, 12)}\``,
-    `- LGTM：${review.url}`,
-    `- 质量门：HEAD 绑定 ✓ / LGTM 匹配 ✓ / CI 全绿 ✓ / Owner Gate 审计 0 命中 ✓`,
+    `Solo Mode 到达 merge 门（决策⑤：不自动 merge）。`,
+    `- HEAD：\`${head.slice(0, 12)}\``,
+    `- LGTM（reviewer）：${lgtm.review_id}`,
+    `- CI 全绿 ✓ / gate 审计 0 命中 ✓`,
+    `- 待 Repo Owner 执行 \`npm run pilot -- merge ${number} --verdict merge\`。`,
   ].join('\n'));
-  console.log(`#${number} merged (solo auto) -> verifying`);
+  console.log(`#${number} -> need:repo-owner（solo 停 merge 门）`);
   return null;
 }
 
@@ -798,7 +812,7 @@ function advanceOnce(config, number) {
     }
     case 'in-review': {
       const result = autoMerge(config, item, alias, repo, state);
-      return { progress: result === null, reason: result ?? 'merged' };
+      return { progress: result === null, reason: result ?? 'merge-gate（待 repo-owner）' };
     }
     case 'verifying': {
       const result = autoVerify(config, item, alias, repo, state);
@@ -855,6 +869,7 @@ try {
     else if (command === 'submit') submit(config, requireNumber(positionals[0]));
     else if (command === 'ci') ci(config, requireNumber(positionals[0]));
     else if (command === 'review') review(config, requireNumber(positionals[0]), flags);
+    else if (command === 'merge') merge(config, requireNumber(positionals[0]), flags);
     else if (command === 'verify') verify(config, requireNumber(positionals[0]), flags);
     else if (command === 'close') closeIssue(config, requireNumber(positionals[0]), flags);
     else if (command === 'advance') advance(config, requireNumber(positionals[0]));
