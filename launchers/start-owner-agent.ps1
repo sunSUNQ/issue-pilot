@@ -39,7 +39,6 @@ $GitConfig  = Join-Path $RuntimeDir 'gitconfig'
 $AskPass    = Join-Path $RuntimeDir 'askpass.cmd'
 $KeysDir    = Join-Path $RuntimeDir 'keys'
 $PemPrimary = Join-Path $KeysDir 'pl-owner-reviewer.private-key.pem'
-$PemFallback = 'C:\Users\sunqinghw\Downloads\pl-owner-reviewer.2026-10-20.private-key.pem'
 $WritePem   = Join-Path $KeysDir 'pl-owner-control-write.private-key.pem'
 
 function Abort([string]$reason) { Write-Host "LAUNCHER_ABORT[$Role]: $reason" -ForegroundColor Red; exit 1 }
@@ -89,9 +88,8 @@ exit /b 0
 }
 
 # --- 3. locate PEMs ----------------------------------------------------------
-$PemPath = if (Test-Path -LiteralPath $PemPrimary) { $PemPrimary }
-  elseif (Test-Path -LiteralPath $PemFallback) { $PemFallback; Write-Host "WARN[$Role]: PEM still in Downloads (owner migration pending): $PemFallback" -ForegroundColor Yellow }
-  else { Abort "PEM not found at $PemPrimary or $PemFallback" }
+$PemPath = $PemPrimary
+if (-not (Test-Path -LiteralPath $PemPath)) { Abort "PRODUCT PEM not found: $PemPath" }
 if (-not (Test-Path -LiteralPath $WritePem)) { Abort "WRITE PEM not found: $WritePem (place pl-owner-control-write private key here)" }
 
 # --- 4. mint + self-verify PRODUCT token (product repo, primary App) ----------
