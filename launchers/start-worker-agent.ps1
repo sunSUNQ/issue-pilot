@@ -26,7 +26,7 @@ $ExpectedBot    = 'pl-issue-worker[bot]'
 $RepoFull       = 'sunSUNQ/provenlattice'
 # write side (control repo, Issues:Write)
 $WriteAppId          = '5885389'                 # pl-worker-control-write App
-$WriteInstallationId = '<FILL_AFTER_OWNER_REPORTS>'   # installed on sunSUNQ/issue-pilot only
+$WriteInstallationId = '184947819'                 # installed on sunSUNQ/issue-pilot only
 $WriteExpectedBot    = 'pl-worker-control-write[bot]'
 $ControlRepo         = 'sunSUNQ/issue-pilot'
 $ControlRoot    = 'D:\issue-pilot'
