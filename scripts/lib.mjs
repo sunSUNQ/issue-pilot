@@ -81,7 +81,10 @@ function ghTokenEnvironment(baseEnv) {
 
 export function run(command, args = [], options = {}) {
   let environment = { ...process.env, ...(options.env ?? {}) };
-  if (command === 'gh') environment = ghTokenEnvironment(environment);
+  // tokenContext 'control' binds the control/write App token: no primary-token
+  // renewal and no primary-token fallback on 401 (fail-closed instead).
+  const control = options.tokenContext === 'control';
+  if (command === 'gh' && !control) environment = ghTokenEnvironment(environment);
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? root,
     encoding: 'utf8',
@@ -94,7 +97,7 @@ export function run(command, args = [], options = {}) {
   if (result.status !== 0) {
     const output = `${result.stderr || ''}\n${result.stdout || ''}`;
     const rejected = /\b401\b|Bad credentials/i.test(output);
-    if (command === 'gh' && process.env.PL_ENFORCE_APP === '1' && !options.noRetry401 && rejected) {
+    if (command === 'gh' && process.env.PL_ENFORCE_APP === '1' && !options.noRetry401 && rejected && !control) {
       const minted = mintAppToken(environment);
       if (minted.ok) {
         adoptMintedToken(minted);
@@ -174,33 +177,31 @@ export function repoAliasOf(issue, config) {
   return alias;
 }
 
-export function issue(config, number, opts = {}) {
-  const text = run('gh', [
+export function issue(config, number) {
+  const text = controlGh([
     'issue', 'view', String(number), '-R', config.issueRepository,
     '--json', 'number,title,body,labels,assignees,url,state',
-  ], { env: opts.env ?? {} }).stdout;
+  ]).stdout;
   return JSON.parse(text);
 }
 
-export function setStatus(config, number, status, opts = {}) {
-  const env = opts.env ?? {};
-  const current = issue(config, number, opts);
+export function setStatus(config, number, status) {
+  const current = issue(config, number);
   const statuses = labelsOf(current).filter((label) => label.startsWith('status:'));
   for (const label of statuses) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label], { env });
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
   }
-  run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`], { env });
+  controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`]);
 }
 
-export function setNeed(config, number, need, opts = {}) {
-  const env = opts.env ?? {};
-  const current = issue(config, number, opts);
+export function setNeed(config, number, need) {
+  const current = issue(config, number);
   const needs = labelsOf(current).filter((label) => label.startsWith('need:'));
   for (const label of needs) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label], { env });
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
   }
   if (need) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`], { env });
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`]);
   }
 }
 
@@ -214,6 +215,15 @@ const ROLE_PRINCIPALS = {
   reviewer: 'pl-issue-reviewer[bot]',
   owner: 'sunSUNQ',
   worker: 'pl-issue-worker[bot]',
+};
+
+// Per-role control/write App bot — the actual GitHub actor for control-repo
+// (config.issueRepository) writes. Distinct from the product App bot; see
+// policies/governance-v2/reviewer-bot-design.md §3 and the Plan-A six-App model.
+const ROLE_WRITE_BOTS = {
+  reviewer: 'pl-issue-reviewer-write[bot]',
+  owner: 'pl-owner-control-write[bot]',
+  worker: 'pl-worker-control-write[bot]',
 };
 
 // GitHub principal namespace: a human login or a bot login (`<name>[bot]`).
@@ -248,15 +258,17 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
       fail(`身份校验失败：PL_PRINCIPAL 与 role 不符（${principal}，期望 ${expectedPrincipal}）`);
     }
   }
-  // Reviewer 双 App：读/写 token 均须自校验通过（§4 通用校验第 3 条）
-  if (role === 'reviewer') {
+  // 双 App 写侧（Plan A）：任意角色注入 PL_WRITE_GIT_TOKEN 时，写侧 bot 必须
+  // 自校验通过（§4 通用校验第 3 条）。期望值按 role 区分，不复制 reviewer 身份。
+  if (env.PL_WRITE_GIT_TOKEN) {
     const writeBot = env.PL_WRITE_TOKEN_BOT;
     const writeExpected = env.PL_WRITE_EXPECTED_BOT;
     if (!writeBot || !writeExpected || writeBot !== writeExpected) {
-      fail('身份校验失败：reviewer 写侧 token 身份不符（fail-closed）');
+      fail(`身份校验失败：${role} 写侧 token 身份不符（fail-closed）`);
     }
-    if (writeBot !== 'pl-issue-reviewer-write[bot]') {
-      fail(`身份校验失败：reviewer 写侧 bot 不符（${writeBot}）`);
+    const expectedWrite = ROLE_WRITE_BOTS[role];
+    if (writeBot !== expectedWrite) {
+      fail(`身份校验失败：${role} 写侧 bot 不符（${writeBot}，期望 ${expectedWrite}）`);
     }
   }
   return {
@@ -296,6 +308,20 @@ export function assertSingleAssignee(issue) {
 export function writeTokenEnv(env = process.env) {
   if (!env.PL_WRITE_GIT_TOKEN) fail('PL_WRITE_GIT_TOKEN 缺失（写侧 token，fail-closed）');
   return { GH_TOKEN: env.PL_WRITE_GIT_TOKEN, PL_GIT_TOKEN: env.PL_WRITE_GIT_TOKEN };
+}
+
+// Control-repo access entry point. Binds ALL control-repo (config.issueRepository)
+// reads + writes to the control/write App token (PL_WRITE_GIT_TOKEN). Fail-closed
+// if absent — never falls back to the product token. No primary-token renewal/retry.
+export function controlGh(args, options = {}) {
+  const wEnv = writeTokenEnv({ ...process.env, ...(options.env ?? {}) });
+  return run('gh', args, { ...options, env: wEnv, tokenContext: 'control' });
+}
+
+// Product-repo access entry point. Binds ALL product-repo (config.repositories[*])
+// operations to the primary product App token (GH_TOKEN, with renewal + retry).
+export function productGh(args, options = {}) {
+  return run('gh', args, options);
 }
 
 // decision ④ / E15：assignee 变化时记录 OwnerTransfer 事件（审计留痕）。

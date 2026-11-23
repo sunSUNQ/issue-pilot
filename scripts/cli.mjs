@@ -2,10 +2,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertNoRoleOverride, assertSingleAssignee, detectOwnerTransfer, ensurePathOnD,
-  fail, issue, labelsOf, loadConfig, loadState, missingAutoElements, parseArgs,
-  repoAliasOf, root, run, runShell, saveState, setNeed, setStatus, slugify,
-  soloMode, statePath, verifyLauncherIdentity, worktreePath, writeTokenEnv,
+  assertNoRoleOverride, assertSingleAssignee, controlGh, detectOwnerTransfer,
+  ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
+  missingAutoElements, parseArgs, productGh, repoAliasOf, root, run, runShell,
+  saveState, setNeed, setStatus, slugify, soloMode, statePath,
+  verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -104,10 +105,10 @@ function setup(config) {
     ['review:lgtm', '0E8A16'], ['preflight', 'FEF2C0'],
   ];
   for (const [name, color] of labels) {
-    run('gh', ['label', 'create', name, '-R', config.issueRepository, '--color', color, '--force']);
+    controlGh(['label', 'create', name, '-R', config.issueRepository, '--color', color, '--force']);
   }
   // 一次性迁移：删除旧 need:owner（已拆分 need:issue-owner / need:repo-owner）
-  run('gh', ['label', 'delete', 'need:owner', '-R', config.issueRepository, '--yes'], { allowFailure: true });
+  controlGh(['label', 'delete', 'need:owner', '-R', config.issueRepository, '--yes'], { allowFailure: true });
   console.log(`已同步 ${labels.length} 个 labels 到 ${config.issueRepository}（need:owner 已删除）`);
 }
 
@@ -115,7 +116,7 @@ function brief(config, mine) {
   const fields = 'number,title,labels,assignees,updatedAt,url,author';
   const args = ['issue', 'list', '-R', config.issueRepository, '--state', 'open', '--limit', '100', '--json', fields];
   if (mine) args.push('--assignee', '@me');
-  const issues = JSON.parse(run('gh', args).stdout);
+  const issues = JSON.parse(controlGh(args).stdout);
   const order = ['need:issue-owner', 'need:repo-owner', 'need:reviewer', 'need:author', 'other'];
   const groups = new Map(order.map((status) => [status, []]));
   for (const item of issues) {
@@ -136,7 +137,7 @@ function brief(config, mine) {
 
 function search(config, keywords) {
   if (!keywords) fail('search 需要关键词。');
-  const out = run('gh', ['issue', 'list', '-R', config.issueRepository, '--state', 'all', '--search', keywords, '--limit', '50']);
+  const out = controlGh(['issue', 'list', '-R', config.issueRepository, '--state', 'all', '--search', keywords, '--limit', '50']);
   console.log(out.stdout || '没有匹配 Issue。');
 }
 
@@ -176,7 +177,7 @@ function propose(config, flags) {
   if (!title || !flags['body-file']) fail('propose 需要 --title 和 --body-file。');
   const bodyPath = path.resolve(flags['body-file']);
   if (!fs.existsSync(bodyPath)) fail(`正文文件不存在：${bodyPath}`);
-  const result = run('gh', [
+  const result = controlGh([
     'issue', 'create', '-R', config.issueRepository, '--title', title,
     '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo}`,
     '--assignee', '@me',
@@ -192,7 +193,7 @@ function approve(config, number) {
   detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   setStatus(config, number, 'approved');
   setNeed(config, number, 'author');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', 'Owner gate：批准进入实现。']);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', 'Owner gate：批准进入实现。']);
   console.log(`#${number} -> approved`);
 }
 
@@ -216,7 +217,7 @@ function startRun(config, number) {
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
   const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\``;
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
   console.log(target);
 }
 
@@ -246,7 +247,7 @@ function submit(config, number) {
     '', '## 未改变的边界', '', `遵循 \`${repo.policy}\` policy；未授权范围保持不变。`,
     '', '## 风险与回滚', '', '可通过回退本 PR 恢复。',
   ].join('\n');
-  const pr = run('gh', [
+  const pr = productGh([
     'pr', 'create', '-R', repo.github, '--base', repo.base, '--head', branch,
     '--title', item.title.replace(/^\[候选\]\s*/, ''), '--body', body,
   ]).stdout;
@@ -260,33 +261,37 @@ function submit(config, number) {
     launcherRole: process.env.PL_ROLE || null,
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
     '--body', `PR 已提交：${pr}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。`]);
   console.log(pr);
 }
 
 // 三态标签转换表（design §5-8，设置与清除并重，防状态残留）。
 // setNeed 内部会清除所有 need:* 再设目标；review:lgtm 单独增删。
-function applyReviewLabels(config, number, verdict, env) {
+function applyReviewLabels(config, number, verdict) {
   if (verdict === 'lgtm') {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', 'review:lgtm'], { env });
-    setNeed(config, number, 'repo-owner', { env });
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', 'review:lgtm']);
+    setNeed(config, number, 'repo-owner');
   } else if (verdict === 'changes') {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { env, allowFailure: true });
-    setStatus(config, number, 'in-progress', { env });
-    setNeed(config, number, 'author', { env });
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { allowFailure: true });
+    setStatus(config, number, 'in-progress');
+    setNeed(config, number, 'author');
   } else if (verdict === 'blocked') {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { env, allowFailure: true });
-    setNeed(config, number, 'reviewer', { env });
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { allowFailure: true });
+    setNeed(config, number, 'reviewer');
   }
 }
 
 function reviewCommentBody(verdict, record, blockedReason, note) {
   const table = [
+    `| operation | ${record.operation} |`,
     `| launcher_role | ${record.launcher_role} |`,
     `| principal | ${record.principal ?? '(n/a)'} |`,
     `| github_login | ${record.github_login ?? '(n/a)'} |`,
+    `| token_bot | ${record.token_bot ?? '(n/a)'} |`,
     `| writer_login | ${record.writer_login ?? '(n/a)'} |`,
+    `| repository | ${record.repository} |`,
+    `| control_repository | ${record.control_repository} |`,
     `| reviewer_verdict | ${record.reviewer_verdict} |`,
     `| reviewed_head_sha | \`${record.reviewed_head_sha ?? '(none)'}\` |`,
     `| reviewed_at | ${record.reviewed_at} |`,
@@ -313,9 +318,8 @@ function review(config, number, flags) {
   // 1. R7 身份校验（fail-closed，约束 6）
   const identity = verifyLauncherIdentity(process.env);
 
-  // 2. 读 issue（控制仓 → 写侧 token；读 App 无控制仓 Issues 权限）
-  const wEnv = writeTokenEnv(process.env);
-  const item = issue(config, number, { env: wEnv });
+  // 2. 读 issue（控制仓 → 控制写侧 token；读 App 无控制仓 Issues 权限）
+  const item = issue(config, number);
   if (!labelsOf(item).includes('status:in-review')) fail(`#${number} 当前不在 in-review。`);
   const assignee = assertSingleAssignee(item);
 
@@ -351,10 +355,14 @@ function review(config, number, flags) {
   const reviewId = `${number}:${pr.number}:${headForReview}:${identity.principal}:${verdict}`;
   const record = {
     review_id: reviewId,
+    operation: 'review',
     launcher_role: identity.role,
     principal: identity.principal,
     github_login: identity.githubLogin,
+    token_bot: identity.tokenBot,
     writer_login: identity.writeTokenBot ?? identity.tokenBot,
+    repository: repo.github,
+    control_repository: config.issueRepository,
     reviewer_verdict: verdict,
     reviewed_head_sha: (verdict === 'lgtm' || verdict === 'changes') ? ciHeadSha : null,
     reviewed_at: new Date().toISOString(),
@@ -366,7 +374,7 @@ function review(config, number, flags) {
   const existing = reviews.find((r) => r.review_id === reviewId);
   if (existing && existing.review_url) {
     // E26：评论已写、标签可能失败 → 仅补标签，不重复写评论
-    applyReviewLabels(config, number, verdict, wEnv);
+    applyReviewLabels(config, number, verdict);
     console.log(`#${number} review 幂等（评论已存在，仅补标签）`);
     return;
   }
@@ -377,16 +385,16 @@ function review(config, number, flags) {
   else nextReviews = [...reviews, record];
   saveState(config, alias, number, { reviews: nextReviews });
 
-  // 7. 写评论（写侧 token）
+  // 7. 写评论（控制写侧 token）
   const body = reviewCommentBody(verdict, record, blockedReason, flags.note);
-  const commentOut = run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body], { env: wEnv });
+  const commentOut = controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
 
   // 8. 回填 review_url
   const withUrl = nextReviews.map((r) => (r.review_id === reviewId ? { ...r, review_url: commentOut.stdout } : r));
   saveState(config, alias, number, { reviews: withUrl });
 
   // 9. 派生标签（派生前重读，幂等应用）
-  applyReviewLabels(config, number, verdict, wEnv);
+  applyReviewLabels(config, number, verdict);
 
   console.log(`#${number} -> ${verdict}${blockedReason ? `（${blockedReason}）` : ''}`);
 }
@@ -416,7 +424,7 @@ function getRequiredChecks(config, repo, base) {
   };
 
   // 1) Rulesets（现代权威来源）
-  const rsList = JSON.parse(run('gh', ['api', `repos/${repo.github}/rulesets`]).stdout);
+  const rsList = JSON.parse(productGh(['api', `repos/${repo.github}/rulesets`]).stdout);
   for (const rs of rsList) {
     if (!rulesetApplies(rs, base)) continue;
     for (const rule of rs.rules ?? []) {
@@ -428,7 +436,7 @@ function getRequiredChecks(config, repo, base) {
   }
 
   // 2) 传统 Branch Protection（404 预期跳过；403/500 等 fail-closed）
-  const bp = run('gh', ['api', `repos/${repo.github}/branches/${base}/protection`], { allowFailure: true });
+  const bp = productGh(['api', `repos/${repo.github}/branches/${base}/protection`], { allowFailure: true });
   if (bp.status === 0) {
     const data = JSON.parse(bp.stdout);
     for (const ctx of data.required_status_checks?.contexts ?? []) add(ctx, null);
@@ -446,8 +454,8 @@ function getRequiredChecks(config, repo, base) {
 // fail-closed：pending/skipped/neutral/cancelled/timed_out/stale/缺失 → 不满足。
 function canEnterReview(config, repo, base, headSha) {
   const required = getRequiredChecks(config, repo, base);
-  const checkRuns = JSON.parse(run('gh', ['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
-  const statuses = JSON.parse(run('gh', ['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
+  const checkRuns = JSON.parse(productGh(['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
+  const statuses = JSON.parse(productGh(['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
   const missing = [];
   for (const { context, integration_id } of required) {
     const cr = checkRuns.find((c) => c.name === context && (integration_id == null || c.app?.id === integration_id));
@@ -482,12 +490,12 @@ function ci(config, number) {
     saveState(config, alias, number, { ciHeadSha: headSha, ciVerifiedAt: new Date().toISOString() });
     setStatus(config, number, 'in-review');
     setNeed(config, number, 'reviewer');
-    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
       '--body', `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。`]);
     console.log(`#${number} -> in-review（CI 全绿，ciHeadSha=${headSha.slice(0, 8)}）`);
   } else {
     setNeed(config, number, 'author');
-    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
       '--body', `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}`]);
     console.log(`#${number} -> need:author（CI 未全绿）`);
   }
@@ -536,8 +544,8 @@ function merge(config, number, flags) {
 
   if (verdict === 'merge') {
     if (failures.length) fail(`merge 四门重检失败：\n- ${failures.join('\n- ')}`);
-    run('gh', ['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
-    const merged = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
+    productGh(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
+    const merged = JSON.parse(productGh(['pr', 'view', String(pr.number), '-R', repo.github,
       '--json', 'mergeCommit,state']).stdout);
     const mergedSha = merged.mergeCommit?.oid ?? null;
     saveState(config, alias, number, {
@@ -546,7 +554,7 @@ function merge(config, number, flags) {
     });
     setStatus(config, number, 'verifying');
     setNeed(config, number, 'issue-owner');
-    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
       '--body', `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}`]);
     console.log(`#${number} merged -> verifying`);
   } else {
@@ -554,7 +562,7 @@ function merge(config, number, flags) {
     saveState(config, alias, number, { mergeVerdict: 'rework', reworkAt: new Date().toISOString(), reworkReason: reason });
     setStatus(config, number, 'in-progress');
     setNeed(config, number, 'author');
-    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
       '--body', `Repo Owner 退回（rework）：\n\n${reason}`]);
     console.log(`#${number} -> in-progress（rework）`);
   }
@@ -569,7 +577,7 @@ function verify(config, number, flags) {
   assertSingleAssignee(item);   // 决策④
   detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const evidence = fs.readFileSync(evidencePath, 'utf8');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}`]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}`]);
   setStatus(config, number, 'verified');
   setNeed(config, number, 'issue-owner');
   console.log(`#${number} -> verified`);
@@ -584,9 +592,9 @@ function closeIssue(config, number, flags) {
   assertSingleAssignee(item);   // 决策④
   detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const summary = fs.readFileSync(summaryPath, 'utf8');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}`]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}`]);
   setNeed(config, number, null);
-  run('gh', ['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
+  controlGh(['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
   console.log(`#${number} closed`);
 }
 
@@ -619,13 +627,13 @@ function typeOf(item) {
 function hold(config, number, reason) {
   setStatus(config, number, 'hold');
   setNeed(config, number, 'issue-owner');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
     '--body', `Solo Mode HOLD：${reason}\n\n等待 Owner 决策（自动路径已停止）。`]);
   console.log(`#${number} -> hold (${reason})`);
 }
 
 function comment(config, number, body) {
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
 }
 
 function titleTokens(title) {
@@ -640,7 +648,7 @@ function autoApprove(config, item) {
   const missing = missingAutoElements(item.body);
   if (missing.length) return `正文缺少提案要素：${missing.join('、')}`;
   const tokens = titleTokens(item.title);
-  const open = JSON.parse(run('gh', ['issue', 'list', '-R', config.issueRepository,
+  const open = JSON.parse(controlGh(['issue', 'list', '-R', config.issueRepository,
     '--state', 'open', '--limit', '100', '--json', 'number,title']).stdout);
   const duplicate = open.filter((other) => other.number !== number).some((other) => {
     const shared = [...tokens].filter((token) => titleTokens(other.title).has(token));
@@ -661,17 +669,17 @@ function autoApprove(config, item) {
 }
 
 function findPr(config, repo, branch) {
-  const out = run('gh', ['pr', 'list', '-R', repo.github, '--head', branch,
+  const out = productGh(['pr', 'list', '-R', repo.github, '--head', branch,
     '--state', 'all', '--json', 'number,url,headRefOid,state'], { allowFailure: true });
   const prs = JSON.parse(out.stdout || '[]');
   return prs.find((pr) => pr.state === 'OPEN') ?? prs[0] ?? null;
 }
 
 function gateAudit(config, repo, prNumber) {
-  const files = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '-R', repo.github,
+  const files = JSON.parse(productGh(['pr', 'view', String(prNumber), '-R', repo.github,
     '--json', 'files']).stdout).files;
   const violations = [];
-  const diff = run('gh', ['pr', 'diff', String(prNumber), '-R', repo.github],
+  const diff = productGh(['pr', 'diff', String(prNumber), '-R', repo.github],
     { allowFailure: true }).stdout;
   const added = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of files) {
@@ -734,7 +742,7 @@ function autoVerify(config, item, alias, repo, state) {
   const branch = `issue-pilot/${number}-${slugify(item.title)}`;
   const found = findPr(config, repo, branch);
   if (!found) return '未找到 PR';
-  const view = JSON.parse(run('gh', ['pr', 'view', String(found.number), '-R', repo.github,
+  const view = JSON.parse(productGh(['pr', 'view', String(found.number), '-R', repo.github,
     '--json', 'state,mergeCommit,url']).stdout);
   if (view.state !== 'MERGED') return `PR #${found.number} 尚未合并`;
   const mergedSha = view.mergeCommit?.oid ?? state.mergedSha;
