@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 # --- pinned role constants (OWNER) ------------------------------------------
 $Role           = 'owner'
 $AppId          = '5394867'                      # pl-owner-reviewer App
-$InstallationId = '173364423'                    # pinned installation on sunSUNQ
+$InstallationId = '184866263'                    # pinned installation on sunSUNQ
 $ExpectedBot    = 'pl-owner-reviewer[bot]'
 $RepoFull       = 'sunSUNQ/provenlattice'
 $ControlRoot    = 'D:\issue-pilot'

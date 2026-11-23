@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 # --- pinned role constants (WORKER) ------------------------------------------
 $Role           = 'worker'
 $AppId          = '5394857'                      # pl-issue-worker App
-$InstallationId = '173364328'                    # pinned installation on sunSUNQ
+$InstallationId = '184866208'                    # pinned installation on sunSUNQ
 $ExpectedBot    = 'pl-issue-worker[bot]'
 $RepoFull       = 'sunSUNQ/provenlattice'
 $ControlRoot    = 'D:\issue-pilot'
