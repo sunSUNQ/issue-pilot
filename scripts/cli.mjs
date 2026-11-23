@@ -4,9 +4,9 @@ import path from 'node:path';
 import {
   assertNoRoleOverride, assertSingleAssignee, controlGh, detectOwnerTransfer,
   ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
-  missingAutoElements, parseArgs, productGh, repoAliasOf, root, run, runShell,
-  saveState, setNeed, setStatus, slugify, soloMode, statePath,
-  verifyLauncherIdentity, worktreePath,
+  missingAutoElements, parseArgs, productGh, repoAliasOf, requireIssueOwner,
+  root, run, runShell, saveState, setNeed, setStatus, slugify, soloMode,
+  statePath, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -29,7 +29,7 @@ function usage() {
   search <keywords>
   repo list
   repo add <alias> --path <local> --github <owner/repo> [--base main] [--policy name]
-  propose --repo <alias> --type <type> --title <text> --body-file <path>
+  propose --repo <alias> --type <type> --title <text> --body-file <path> --assignee <owner-login>
   approve <issue>
   run <issue>
   submit <issue>
@@ -175,12 +175,15 @@ function propose(config, flags) {
   if (!repo || !config.repositories[repo]) fail('propose 需要已注册的 --repo。');
   if (!TYPE_COLORS[type]) fail(`不支持的 --type：${type}`);
   if (!title || !flags['body-file']) fail('propose 需要 --title 和 --body-file。');
+  // Issue Owner：assignee = Issue Owner（生命周期负责人），不得用命令执行者
+  // 的 App bot（@me / 控制写侧 bot）自动充当；未显式指定 → fail-closed。
+  const assignee = requireIssueOwner(flags.assignee);
   const bodyPath = path.resolve(flags['body-file']);
   if (!fs.existsSync(bodyPath)) fail(`正文文件不存在：${bodyPath}`);
   const result = controlGh([
     'issue', 'create', '-R', config.issueRepository, '--title', title,
     '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo}`,
-    '--assignee', '@me',
+    '--assignee', assignee,
   ]);
   setNeed(config, Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0), 'issue-owner');
   console.log(result.stdout);

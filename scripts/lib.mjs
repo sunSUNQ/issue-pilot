@@ -235,6 +235,17 @@ export function isGitHubPrincipal(value) {
   return typeof value === 'string' && GITHUB_PRINCIPAL_RE.test(value);
 }
 
+// Issue Owner semantics (Plan A fix): the assignee is the Issue Owner — the
+// human responsible for the issue lifecycle — NOT the bot that happens to run
+// the command. `propose` must receive an explicit, human GitHub login; never
+// default to `@me` / the control-write App bot. Fail-closed otherwise.
+export function requireIssueOwner(assignee) {
+  if (!assignee || !isGitHubPrincipal(assignee) || /\[bot\]$/.test(assignee)) {
+    fail('propose 必须显式 --assignee <owner-login>（Issue Owner 须为人类登录名，fail-closed；禁止 bot）');
+  }
+  return assignee;
+}
+
 // verifyLauncherIdentity — generic + role-specific launcher identity checks.
 // Fail-closed on any anomaly (R7 constraints 1–6 / §4 通用校验 + 角色专属校验).
 // Returns the normalized identity (role / principal / githubLogin / tokenBot).
