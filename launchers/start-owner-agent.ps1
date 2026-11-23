@@ -104,6 +104,8 @@ if ($extras.Count -gt 0) { Write-Host "WARN[$Role]: installation also covers: $(
 $env:GH_TOKEN              = $m.token
 $env:PL_GIT_TOKEN          = $m.token
 $env:PL_ROLE               = $Role
+$env:PL_PRINCIPAL          = 'sunSUNQ'
+$env:PL_GITHUB_LOGIN       = 'pl-owner-reviewer[bot]'
 $env:PL_APP_ID             = $AppId
 $env:PL_APP_INSTALLATION_ID = $InstallationId
 $env:PL_APP_KEY_PATH       = $PemPath

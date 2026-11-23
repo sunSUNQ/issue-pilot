@@ -26,8 +26,8 @@ $ReadInstallationId = '184852170'            # fresh install on sunSUNQ/provenla
 $ReadExpectedBot    = 'pl-issue-reviewer-read[bot]'
 $RepoFull           = 'sunSUNQ/provenlattice'
 # write side (control repo, Issues:Write, comments only)
-$WriteAppId          = '5881570'             # TODO: fill after App creation
-$WriteInstallationId = '184852983'    # TODO: fill after installation
+$WriteAppId          = '5881570'             # pl-issue-reviewer-write App
+$WriteInstallationId = '184852983'            # fresh install on sunSUNQ/issue-pilot
 $WriteExpectedBot    = 'pl-issue-reviewer-write[bot]'
 $ControlRepo         = 'sunSUNQ/issue-pilot'
 $ControlRoot         = 'D:\issue-pilot'
