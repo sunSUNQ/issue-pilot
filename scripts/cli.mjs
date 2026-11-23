@@ -2,10 +2,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertNoRoleOverride, assertSingleAssignee, ensurePathOnD, fail, issue,
-  labelsOf, loadConfig, loadState, missingAutoElements, parseArgs, repoAliasOf,
-  root, run, runShell, saveState, setNeed, setStatus, slugify, soloMode,
-  statePath, verifyLauncherIdentity, worktreePath, writeTokenEnv,
+  assertNoRoleOverride, assertSingleAssignee, detectOwnerTransfer, ensurePathOnD,
+  fail, issue, labelsOf, loadConfig, loadState, missingAutoElements, parseArgs,
+  repoAliasOf, root, run, runShell, saveState, setNeed, setStatus, slugify,
+  soloMode, statePath, verifyLauncherIdentity, worktreePath, writeTokenEnv,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -189,6 +189,7 @@ function approve(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') fail(`Issue #${number} 不是 OPEN。`);
   assertSingleAssignee(item);   // 决策④：0/多值 assignee 阻止 approve
+  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   setStatus(config, number, 'approved');
   setNeed(config, number, 'author');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', 'Owner gate：批准进入实现。']);
@@ -210,6 +211,10 @@ function startRun(config, number) {
   run('git', ['-C', repo.path, 'worktree', 'add', '-b', branch, target, start]);
   setStatus(config, number, 'in-progress');
   setNeed(config, number, 'author');
+  saveState(config, alias, number, {
+    launcherRole: process.env.PL_ROLE || null,
+    githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
+  });
   const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\``;
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
   console.log(target);
@@ -558,6 +563,7 @@ function verify(config, number, flags) {
   const item = issue(config, number);
   if (!labelsOf(item).includes('review:lgtm')) fail(`#${number} 尚无独立 review:lgtm。`);
   assertSingleAssignee(item);   // 决策④
+  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const evidence = fs.readFileSync(evidencePath, 'utf8');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}`]);
   setStatus(config, number, 'verified');
@@ -572,6 +578,7 @@ function closeIssue(config, number, flags) {
   const item = issue(config, number);
   if (!labelsOf(item).includes('status:verified')) fail(`#${number} 尚未完成 verified Gate。`);
   assertSingleAssignee(item);   // 决策④
+  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const summary = fs.readFileSync(summaryPath, 'utf8');
   run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}`]);
   setNeed(config, number, null);

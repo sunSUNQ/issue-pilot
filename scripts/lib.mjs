@@ -296,6 +296,20 @@ export function writeTokenEnv(env = process.env) {
   return { GH_TOKEN: env.PL_WRITE_GIT_TOKEN, PL_GIT_TOKEN: env.PL_WRITE_GIT_TOKEN };
 }
 
+// decision ④ / E15：assignee 变化时记录 OwnerTransfer 事件（审计留痕）。
+// 首次记录当前 assignee 作为基线；后续变化 append 到 state.ownerTransfers。
+export function detectOwnerTransfer(config, alias, number, issue) {
+  const assignee = assigneesOf(issue)[0] ?? null;
+  const state = loadState(config, alias, number);
+  if (state.assignee && assignee && state.assignee !== assignee) {
+    const entry = { from: state.assignee, to: assignee, at: new Date().toISOString() };
+    saveState(config, alias, number, { assignee, ownerTransfers: [...(state.ownerTransfers ?? []), entry] });
+    return entry;
+  }
+  if (assignee) saveState(config, alias, number, { assignee });
+  return null;
+}
+
 export function worktreePath(config, alias, number) {
   return path.resolve(config.worktreeRoot, `${alias}-${number}`);
 }
