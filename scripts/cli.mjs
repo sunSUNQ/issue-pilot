@@ -32,6 +32,7 @@ function usage() {
   approve <issue>
   run <issue>
   submit <issue>
+  ci <issue>
   review <issue> --verdict <lgtm|changes|blocked> --sha <commit> [--note <text>]
   verify <issue> --evidence-file <path>
   close <issue> --summary-file <path>
@@ -243,15 +244,18 @@ function submit(config, number) {
     'pr', 'create', '-R', repo.github, '--base', repo.base, '--head', branch,
     '--title', item.title.replace(/^\[候选\]\s*/, ''), '--body', body,
   ]).stdout;
-  setStatus(config, number, 'in-review');
-  setNeed(config, number, 'reviewer');
+  setStatus(config, number, 'in-progress');
+  setNeed(config, number, 'author');
   const branchName = run('git', ['-C', target, 'branch', '--show-current']).stdout;
   const headNow = run('git', ['-C', target, 'rev-parse', 'HEAD']).stdout;
   saveState(config, alias, number, {
     prUrl: pr, head: headNow, branch: branchName,
     submittedAt: new Date().toISOString(),
+    launcherRole: process.env.PL_ROLE || null,
+    githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `PR 已提交：${pr}`]);
+  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+    '--body', `PR 已提交：${pr}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。`]);
   console.log(pr);
 }
 
@@ -375,6 +379,108 @@ function review(config, number, flags) {
   applyReviewLabels(config, number, verdict, wEnv);
 
   console.log(`#${number} -> ${verdict}${blockedReason ? `（${blockedReason}）` : ''}`);
+}
+
+// ---------------------------------------------------------------------------
+// CI Gate（design §6）：Required Checks 权威来源 + canEnterReview 三分匹配
+// ---------------------------------------------------------------------------
+
+function rulesetApplies(rs, base) {
+  if (rs.enforcement !== 'active') return false;
+  if (rs.target !== 'branch') return false;
+  const include = rs.conditions?.ref_name?.include ?? [];
+  return include.includes('~DEFAULT_BRANCH') || include.includes(base);
+}
+
+// getRequiredChecks(repo, base) -> [{ context, integration_id|null }]
+// Rulesets + Branch Protection 双查取并集，key=(context, integration_id) 去重。
+// 空并集或 Rulesets 不可读 → fail-closed；BP 404 属预期（跳过）。
+function getRequiredChecks(config, repo, base) {
+  const required = [];
+  const seen = new Set();
+  const add = (context, integrationId) => {
+    const key = `${context}\u0000${integrationId ?? ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    required.push({ context, integration_id: integrationId ?? null });
+  };
+
+  // 1) Rulesets（现代权威来源）
+  const rsList = JSON.parse(run('gh', ['api', `repos/${repo.github}/rulesets`]).stdout);
+  for (const rs of rsList) {
+    if (!rulesetApplies(rs, base)) continue;
+    for (const rule of rs.rules ?? []) {
+      if (rule.type !== 'required_status_checks') continue;
+      for (const sc of rule.parameters?.required_status_checks ?? []) {
+        add(sc.context, sc.integration_id ?? null);
+      }
+    }
+  }
+
+  // 2) 传统 Branch Protection（404 预期跳过；403/500 等 fail-closed）
+  const bp = run('gh', ['api', `repos/${repo.github}/branches/${base}/protection`], { allowFailure: true });
+  if (bp.status === 0) {
+    const data = JSON.parse(bp.stdout);
+    for (const ctx of data.required_status_checks?.contexts ?? []) add(ctx, null);
+    for (const chk of data.required_status_checks?.checks ?? []) add(chk.context, chk.app_id ?? null);
+  } else if (!/404/i.test(`${bp.stderr}${bp.stdout}`)) {
+    fail(`Branch Protection 不可读（fail-closed）：${bp.stderr || `exit ${bp.status}`}`);
+  }
+
+  // 3) 并集为空 → fail-closed（G4/G10）
+  if (required.length === 0) fail('Required Checks 为空（fail-closed，G4）');
+  return required;
+}
+
+// canEnterReview(pr)：Check Runs 与 Commit Status 分别匹配（字段不同，不混用）。
+// fail-closed：pending/skipped/neutral/cancelled/timed_out/stale/缺失 → 不满足。
+function canEnterReview(config, repo, base, headSha) {
+  const required = getRequiredChecks(config, repo, base);
+  const checkRuns = JSON.parse(run('gh', ['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
+  const statuses = JSON.parse(run('gh', ['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
+  const missing = [];
+  for (const { context, integration_id } of required) {
+    const cr = checkRuns.find((c) => c.name === context && (integration_id == null || c.app?.id === integration_id));
+    if (cr) {
+      if (cr.status !== 'completed') { missing.push(`${context}: status=${cr.status}（未完成）`); continue; }
+      if (cr.conclusion !== 'success') { missing.push(`${context}: conclusion=${cr.conclusion}（非 success）`); continue; }
+      continue;
+    }
+    if (integration_id == null) {
+      const cs = statuses.find((s) => s.context === context);
+      if (cs && cs.state === 'success') continue;
+    }
+    missing.push(`${context}: 缺失或不成功（integration_id=${integration_id ?? 'null'}）`);
+  }
+  if (missing.length) return { ready: false, head_sha: headSha, required, missing };
+  return { ready: true, head_sha: headSha, required };
+}
+
+// ci <issue> — 幂等 CI 门禁（design §5-7）。canEnterReview 全绿写入 ciHeadSha
+// 并转 in-review + need:reviewer；否则 need:author + 失败明细（含 SHA）。
+function ci(config, number) {
+  const item = issue(config, number);
+  const alias = repoAliasOf(item, config);
+  const repo = config.repositories[alias];
+  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
+  const pr = findPr(config, repo, branch);
+  if (!pr) fail('未找到开放 PR');
+  if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+  const headSha = pr.headRefOid;
+  const result = canEnterReview(config, repo, repo.base, headSha);
+  if (result.ready) {
+    saveState(config, alias, number, { ciHeadSha: headSha, ciVerifiedAt: new Date().toISOString() });
+    setStatus(config, number, 'in-review');
+    setNeed(config, number, 'reviewer');
+    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。`]);
+    console.log(`#${number} -> in-review（CI 全绿，ciHeadSha=${headSha.slice(0, 8)}）`);
+  } else {
+    setNeed(config, number, 'author');
+    run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}`]);
+    console.log(`#${number} -> need:author（CI 未全绿）`);
+  }
 }
 
 function verify(config, number, flags) {
@@ -747,6 +853,7 @@ try {
     else if (command === 'approve') approve(config, requireNumber(positionals[0]));
     else if (command === 'run') startRun(config, requireNumber(positionals[0]));
     else if (command === 'submit') submit(config, requireNumber(positionals[0]));
+    else if (command === 'ci') ci(config, requireNumber(positionals[0]));
     else if (command === 'review') review(config, requireNumber(positionals[0]), flags);
     else if (command === 'verify') verify(config, requireNumber(positionals[0]), flags);
     else if (command === 'close') closeIssue(config, requireNumber(positionals[0]), flags);
