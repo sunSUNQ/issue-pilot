@@ -174,32 +174,126 @@ export function repoAliasOf(issue, config) {
   return alias;
 }
 
-export function issue(config, number) {
+export function issue(config, number, opts = {}) {
   const text = run('gh', [
     'issue', 'view', String(number), '-R', config.issueRepository,
     '--json', 'number,title,body,labels,assignees,url,state',
-  ]).stdout;
+  ], { env: opts.env ?? {} }).stdout;
   return JSON.parse(text);
 }
 
-export function setStatus(config, number, status) {
-  const current = issue(config, number);
+export function setStatus(config, number, status, opts = {}) {
+  const env = opts.env ?? {};
+  const current = issue(config, number, opts);
   const statuses = labelsOf(current).filter((label) => label.startsWith('status:'));
   for (const label of statuses) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
+    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label], { env });
   }
-  run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`]);
+  run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`], { env });
 }
 
-export function setNeed(config, number, need) {
-  const current = issue(config, number);
+export function setNeed(config, number, need, opts = {}) {
+  const env = opts.env ?? {};
+  const current = issue(config, number, opts);
   const needs = labelsOf(current).filter((label) => label.startsWith('need:'));
   for (const label of needs) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
+    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label], { env });
   }
   if (need) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`]);
+    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`], { env });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Governance V2 identity / assignee / dual-token helpers
+// (frozen: policies/governance-v2/reviewer-bot-design.md §3–§4)
+// ---------------------------------------------------------------------------
+
+// Per-role hard-pinned governance principal (R7 role-specific check).
+const ROLE_PRINCIPALS = {
+  reviewer: 'pl-issue-reviewer[bot]',
+  owner: 'sunSUNQ',
+  worker: 'pl-issue-worker[bot]',
+};
+
+// GitHub principal namespace: a human login or a bot login (`<name>[bot]`).
+// Rejects free-form strings so PL_PRINCIPAL is only ever compared against
+// assignees in the same namespace (reviewer-bot-design.md §3 "命名空间").
+const GITHUB_PRINCIPAL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$/;
+
+export function isGitHubPrincipal(value) {
+  return typeof value === 'string' && GITHUB_PRINCIPAL_RE.test(value);
+}
+
+// verifyLauncherIdentity — generic + role-specific launcher identity checks.
+// Fail-closed on any anomaly (R7 constraints 1–6 / §4 通用校验 + 角色专属校验).
+// Returns the normalized identity (role / principal / githubLogin / tokenBot).
+export function verifyLauncherIdentity(env = process.env, opts = {}) {
+  if (env.PL_ENFORCE_APP !== '1') {
+    fail('身份校验失败：PL_ENFORCE_APP != 1（非 Launcher 会话，fail-closed）');
+  }
+  const role = env.PL_ROLE;
+  if (!['worker', 'reviewer', 'owner'].includes(role)) {
+    fail(`身份校验失败：PL_ROLE 缺失或非法（${role ?? '(unset)'}）`);
+  }
+  if (!env.PL_TOKEN_BOT || !env.PL_EXPECTED_BOT || env.PL_TOKEN_BOT !== env.PL_EXPECTED_BOT) {
+    fail(`身份校验失败：token 身份不符（${env.PL_TOKEN_BOT ?? '(unset)'} != ${env.PL_EXPECTED_BOT ?? '(unset)'}）`);
+  }
+  const principal = env.PL_PRINCIPAL;
+  const expectedPrincipal = ROLE_PRINCIPALS[role];
+  if (opts.requirePrincipal !== false) {
+    if (!principal) fail(`身份校验失败：PL_PRINCIPAL 缺失（role=${role}）`);
+    if (!isGitHubPrincipal(principal)) fail(`身份校验失败：PL_PRINCIPAL 非法主体形态（${principal}）`);
+    if (principal !== expectedPrincipal) {
+      fail(`身份校验失败：PL_PRINCIPAL 与 role 不符（${principal}，期望 ${expectedPrincipal}）`);
+    }
+  }
+  // Reviewer 双 App：读/写 token 均须自校验通过（§4 通用校验第 3 条）
+  if (role === 'reviewer') {
+    const writeBot = env.PL_WRITE_TOKEN_BOT;
+    const writeExpected = env.PL_WRITE_EXPECTED_BOT;
+    if (!writeBot || !writeExpected || writeBot !== writeExpected) {
+      fail('身份校验失败：reviewer 写侧 token 身份不符（fail-closed）');
+    }
+    if (writeBot !== 'pl-issue-reviewer-write[bot]') {
+      fail(`身份校验失败：reviewer 写侧 bot 不符（${writeBot}）`);
+    }
+  }
+  return {
+    role,
+    principal,
+    githubLogin: env.PL_GITHUB_LOGIN || env.PL_TOKEN_BOT,
+    tokenBot: env.PL_TOKEN_BOT,
+  };
+}
+
+// Assert the CLI was not handed an external --role/--principal override.
+// Launcher identity is hard-pinned; any attempted override must fail closed.
+export function assertNoRoleOverride(flags) {
+  if (flags.role !== undefined || flags.principal !== undefined) {
+    fail('拒绝 --role/--principal 覆盖（Launcher 身份硬钉，fail-closed）');
+  }
+}
+
+export function assigneesOf(issue) {
+  return (issue.assignees ?? []).map((a) => (typeof a === 'string' ? a : a.login));
+}
+
+// decision ④: the sole assignee is the issue-owner routing key. 0 or >1
+// assignees block owner-gated transitions (approve/verify/close/review).
+export function assertSingleAssignee(issue) {
+  const assignees = assigneesOf(issue);
+  if (assignees.length === 0) fail(`#${issue.number} 无 assignee（决策④：0 assignee 阻止转换）`);
+  if (assignees.length > 1) fail(`#${issue.number} 有 ${assignees.length} 个 assignee（决策④：>1 assignee 阻止转换）`);
+  return assignees[0];
+}
+
+// Write-side token env for control-repo comment/label writes. The reviewer
+// read App has no Issues permission, so control-repo writes must use the
+// write App token (PL_WRITE_GIT_TOKEN). Fail-closed if absent.
+export function writeTokenEnv(env = process.env) {
+  if (!env.PL_WRITE_GIT_TOKEN) fail('PL_WRITE_GIT_TOKEN 缺失（写侧 token，fail-closed）');
+  return { GH_TOKEN: env.PL_WRITE_GIT_TOKEN, PL_GIT_TOKEN: env.PL_WRITE_GIT_TOKEN };
 }
 
 export function worktreePath(config, alias, number) {
