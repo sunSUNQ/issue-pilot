@@ -21,13 +21,13 @@ $ErrorActionPreference = 'Stop'
 # --- pinned role constants (REVIEWER, dual-App) ------------------------------
 $Role           = 'reviewer'
 # read side (product repo, read-only, no Issues)
-$ReadAppId          = '<READ_APP_ID>'               # TODO: fill after App creation
-$ReadInstallationId = '<READ_INSTALLATION_ID>'      # TODO: fill after installation
+$ReadAppId          = '5881440'              # pl-issue-reviewer-read App
+$ReadInstallationId = '184852170'            # fresh install on sunSUNQ/provenlattice
 $ReadExpectedBot    = 'pl-issue-reviewer-read[bot]'
 $RepoFull           = 'sunSUNQ/provenlattice'
 # write side (control repo, Issues:Write, comments only)
-$WriteAppId          = '<WRITE_APP_ID>'             # TODO: fill after App creation
-$WriteInstallationId = '<WRITE_INSTALLATION_ID>'    # TODO: fill after installation
+$WriteAppId          = '5881570'             # TODO: fill after App creation
+$WriteInstallationId = '184852983'    # TODO: fill after installation
 $WriteExpectedBot    = 'pl-issue-reviewer-write[bot]'
 $ControlRepo         = 'sunSUNQ/issue-pilot'
 $ControlRoot         = 'D:\issue-pilot'
@@ -50,7 +50,7 @@ foreach ($tool in 'node', 'git', 'gh') {
 }
 if (-not (Test-Path -LiteralPath $TokenScript)) { Abort "token script missing: $TokenScript" }
 if ($ReadAppId -like '<*' -or $WriteAppId -like '<*') {
-  Abort "App/installation ids not filled in yet — run setup-reviewer-apps wizard first, then edit this script's pinned constants"
+  Abort "App/installation ids not filled in yet 鈥?run setup-reviewer-apps wizard first, then edit this script's pinned constants"
 }
 
 # --- 1. purge inherited credentials (incl. expired/foreign GH_TOKEN) ---------
