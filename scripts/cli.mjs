@@ -284,7 +284,9 @@ function applyReviewLabels(config, number, verdict, env) {
 function reviewCommentBody(verdict, record, blockedReason, note) {
   const table = [
     `| launcher_role | ${record.launcher_role} |`,
-    `| github_login | ${record.github_login} |`,
+    `| principal | ${record.principal ?? '(n/a)'} |`,
+    `| github_login | ${record.github_login ?? '(n/a)'} |`,
+    `| writer_login | ${record.writer_login ?? '(n/a)'} |`,
     `| reviewer_verdict | ${record.reviewer_verdict} |`,
     `| reviewed_head_sha | \`${record.reviewed_head_sha ?? '(none)'}\` |`,
     `| reviewed_at | ${record.reviewed_at} |`,
@@ -350,7 +352,9 @@ function review(config, number, flags) {
   const record = {
     review_id: reviewId,
     launcher_role: identity.role,
+    principal: identity.principal,
     github_login: identity.githubLogin,
+    writer_login: identity.writeTokenBot ?? identity.tokenBot,
     reviewer_verdict: verdict,
     reviewed_head_sha: (verdict === 'lgtm' || verdict === 'changes') ? ciHeadSha : null,
     reviewed_at: new Date().toISOString(),

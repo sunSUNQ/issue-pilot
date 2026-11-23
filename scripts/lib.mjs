@@ -264,6 +264,8 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
     principal,
     githubLogin: env.PL_GITHUB_LOGIN || env.PL_TOKEN_BOT,
     tokenBot: env.PL_TOKEN_BOT,
+    // 实际执行 GitHub 写操作的身份（reviewer 双 App 为写侧 bot；单 App 为 null）
+    writeTokenBot: env.PL_WRITE_TOKEN_BOT ?? null,
   };
 }
 
