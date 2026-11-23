@@ -2,11 +2,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertNoRoleOverride, assertSingleAssignee, controlGh, detectOwnerTransfer,
-  ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
-  missingAutoElements, parseArgs, productGh, repoAliasOf, requireIssueOwner,
-  root, run, runShell, saveState, setNeed, setStatus, slugify, soloMode,
-  statePath, verifyLauncherIdentity, worktreePath,
+assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
+  detectOwnerTransfer, ensurePathOnD, fail, issue, labelsOf, loadConfig,
+  loadState, missingAutoElements, parseArgs, productGh, repoAliasOf,
+  requireIssueOwner, root, run, runShell, saveState, setNeed, setStatus,
+  slugify, soloMode, statePath, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -185,7 +185,10 @@ function propose(config, flags) {
     '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo}`,
     '--assignee', assignee,
   ]);
-  setNeed(config, Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0), 'issue-owner');
+  const number = Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0);
+  setNeed(config, number, 'issue-owner');
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+    '--body', `Issue 创建（propose）。${auditFooter(config, 'propose')}`]);
   console.log(result.stdout);
 }
 
@@ -196,7 +199,7 @@ function approve(config, number) {
   detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   setStatus(config, number, 'approved');
   setNeed(config, number, 'author');
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', 'Owner gate：批准进入实现。']);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `Owner gate：批准进入实现。${auditFooter(config, 'approve')}`]);
   console.log(`#${number} -> approved`);
 }
 
@@ -219,7 +222,7 @@ function startRun(config, number) {
     launcherRole: process.env.PL_ROLE || null,
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
-  const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\``;
+  const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\`${auditFooter(config, 'run')}`;
   controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
   console.log(target);
 }
@@ -265,7 +268,7 @@ function submit(config, number) {
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
   controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-    '--body', `PR 已提交：${pr}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。`]);
+    '--body', `PR 已提交：${pr}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。${auditFooter(config, 'submit')}`]);
   console.log(pr);
 }
 
@@ -494,12 +497,12 @@ function ci(config, number) {
     setStatus(config, number, 'in-review');
     setNeed(config, number, 'reviewer');
     controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。`]);
+      '--body', `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。${auditFooter(config, 'ci')}`]);
     console.log(`#${number} -> in-review（CI 全绿，ciHeadSha=${headSha.slice(0, 8)}）`);
   } else {
     setNeed(config, number, 'author');
     controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}`]);
+      '--body', `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}${auditFooter(config, 'ci')}`]);
     console.log(`#${number} -> need:author（CI 未全绿）`);
   }
 }
@@ -558,7 +561,7 @@ function merge(config, number, flags) {
     setStatus(config, number, 'verifying');
     setNeed(config, number, 'issue-owner');
     controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}`]);
+      '--body', `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}${auditFooter(config, 'merge')}`]);
     console.log(`#${number} merged -> verifying`);
   } else {
     const reason = failures.length ? failures.join('；') : (flags.reason || 'Repo Owner 退回');
@@ -566,7 +569,7 @@ function merge(config, number, flags) {
     setStatus(config, number, 'in-progress');
     setNeed(config, number, 'author');
     controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `Repo Owner 退回（rework）：\n\n${reason}`]);
+      '--body', `Repo Owner 退回（rework）：\n\n${reason}${auditFooter(config, 'merge')}`]);
     console.log(`#${number} -> in-progress（rework）`);
   }
 }
@@ -580,7 +583,7 @@ function verify(config, number, flags) {
   assertSingleAssignee(item);   // 决策④
   detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const evidence = fs.readFileSync(evidencePath, 'utf8');
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}`]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}${auditFooter(config, 'verify')}`]);
   setStatus(config, number, 'verified');
   setNeed(config, number, 'issue-owner');
   console.log(`#${number} -> verified`);
@@ -595,7 +598,7 @@ function closeIssue(config, number, flags) {
   assertSingleAssignee(item);   // 决策④
   detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const summary = fs.readFileSync(summaryPath, 'utf8');
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}`]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}${auditFooter(config, 'close')}`]);
   setNeed(config, number, null);
   controlGh(['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
   console.log(`#${number} closed`);
@@ -631,12 +634,13 @@ function hold(config, number, reason) {
   setStatus(config, number, 'hold');
   setNeed(config, number, 'issue-owner');
   controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-    '--body', `Solo Mode HOLD：${reason}\n\n等待 Owner 决策（自动路径已停止）。`]);
+    '--body', `Solo Mode HOLD：${reason}\n\n等待 Owner 决策（自动路径已停止）。${auditFooter(config, 'hold')}`]);
   console.log(`#${number} -> hold (${reason})`);
 }
 
-function comment(config, number, body) {
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
+function comment(config, number, body, operation) {
+  const full = operation ? `${body}${auditFooter(config, operation)}` : body;
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', full]);
 }
 
 function titleTokens(title) {
@@ -666,7 +670,7 @@ function autoApprove(config, item) {
     '- 提案五要素完整：观察证据 / 期望行为 / 反例或失败条件 / 允许修改范围 / 验收方式',
     `- 查重无命中（标题词元重叠 <60%，开放 Issue ${open.length - 1} 个比对）`,
     `- 依据 policies/codegraph.md 自动推进范围；phase=${soloMode().phase}`,
-  ].join('\n'));
+  ].join('\n'), 'approve');
   console.log(`#${number} -> approved (solo auto)`);
   return null;
 }
@@ -735,7 +739,7 @@ function autoMerge(config, item, alias, repo, state) {
     `- LGTM（reviewer）：${lgtm.review_id}`,
     `- CI 全绿 ✓ / gate 审计 0 命中 ✓`,
     `- 待 Repo Owner 执行 \`npm run pilot -- merge ${number} --verdict merge\`。`,
-  ].join('\n'));
+  ].join('\n'), 'merge-gate');
   console.log(`#${number} -> need:repo-owner（solo 停 merge 门）`);
   return null;
 }

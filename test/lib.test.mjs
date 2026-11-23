@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
-import { labelsOf, mintAppToken, parseArgs, slugify, tokenState } from '../scripts/lib.mjs';
+import { auditFooter, labelsOf, mintAppToken, parseArgs, slugify, tokenState, writeAudit } from '../scripts/lib.mjs';
 
 test('parseArgs separates positionals and flags', () => {
   assert.deepEqual(
@@ -63,4 +63,50 @@ test('control plane keeps no silent OAuth fallback path (R16)', async () => {
   const source = await readFile(new URL('../scripts/lib.mjs', import.meta.url), 'utf8');
   assert.ok(!source.includes('credential fill'), 'git credential fill fallback must stay removed');
   assert.ok(!source.includes('parseGitCredential'), 'credential parsing helper must stay removed');
+});
+
+// --- G11: control-repo write audit (role -> principal -> writer_login -> repo -> operation) ---
+const CAST_CFG = { issueRepository: 'sunSUNQ/issue-pilot' };
+function g11Env(role, writeBot) {
+  const principal = role === 'owner' ? 'sunSUNQ'
+    : role === 'worker' ? 'pl-issue-worker[bot]' : 'pl-issue-reviewer[bot]';
+  const tokenBot = role === 'owner' ? 'pl-owner-reviewer[bot]'
+    : role === 'worker' ? 'pl-issue-worker[bot]' : 'pl-issue-reviewer-read[bot]';
+  return {
+    PL_ENFORCE_APP: '1', PL_ROLE: role, PL_PRINCIPAL: principal,
+    PL_GITHUB_LOGIN: tokenBot, PL_TOKEN_BOT: tokenBot, PL_EXPECTED_BOT: tokenBot,
+    PL_WRITE_GIT_TOKEN: 'write-token',
+    PL_WRITE_TOKEN_BOT: writeBot, PL_WRITE_EXPECTED_BOT: writeBot,
+  };
+}
+
+test('G11 writeAudit exposes the full traceable chain', () => {
+  const a = writeAudit(CAST_CFG, 'propose', g11Env('worker', 'pl-worker-control-write[bot]'));
+  assert.equal(a.role, 'worker');
+  assert.equal(a.principal, 'pl-issue-worker[bot]');
+  assert.equal(a.writer_login, 'pl-worker-control-write[bot]');
+  assert.equal(a.repository, 'sunSUNQ/issue-pilot');
+  assert.equal(a.operation, 'propose');
+});
+
+test('G11 owner audit binds writer_login to the control-write App bot, not the principal', () => {
+  const a = writeAudit(CAST_CFG, 'merge', g11Env('owner', 'pl-owner-control-write[bot]'));
+  assert.equal(a.principal, 'sunSUNQ');
+  assert.equal(a.writer_login, 'pl-owner-control-write[bot]');
+});
+
+test('G11 auditFooter embeds all five fields', () => {
+  const footer = auditFooter(CAST_CFG, 'ci', g11Env('worker', 'pl-worker-control-write[bot]'));
+  assert.ok(footer.includes('role=`worker`'));
+  assert.ok(footer.includes('principal=`pl-issue-worker[bot]`'));
+  assert.ok(footer.includes('writer_login=`pl-worker-control-write[bot]`'));
+  assert.ok(footer.includes('repository=`sunSUNQ/issue-pilot`'));
+  assert.ok(footer.includes('operation=`ci`'));
+});
+
+test('G11 writeAudit fails closed outside a launcher session', () => {
+  assert.throws(() => writeAudit(CAST_CFG, 'propose', { PL_ENFORCE_APP: '0' }), /PL_ENFORCE_APP/);
+  const noPrincipal = { ...g11Env('worker', 'pl-worker-control-write[bot]') };
+  delete noPrincipal.PL_PRINCIPAL;
+  assert.throws(() => writeAudit(CAST_CFG, 'propose', noPrincipal), /PL_PRINCIPAL/);
 });

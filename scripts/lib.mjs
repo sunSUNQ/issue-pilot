@@ -292,6 +292,32 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
   };
 }
 
+// G11 — control-repo write audit. Every control-repo (config.issueRepository)
+// write must expose the traceable chain role -> principal -> writer_login ->
+// repository -> operation (not just review). Calls verifyLauncherIdentity, so
+// any control-repo write outside a valid launcher session fails closed.
+export function writeAudit(config, operation, env = process.env) {
+  const identity = verifyLauncherIdentity(env);
+  return {
+    role: identity.role,
+    principal: identity.principal,
+    writer_login: identity.writeTokenBot ?? identity.tokenBot,
+    repository: config.issueRepository,
+    operation,
+  };
+}
+
+// Markdown footer appended to every control-repo operation comment (audit trail).
+export function auditFooter(config, operation, env = process.env) {
+  const a = writeAudit(config, operation, env);
+  return [
+    '',
+    '---',
+    '<sub>control-plane audit</sub>',
+    `role=\`${a.role}\` principal=\`${a.principal}\` writer_login=\`${a.writer_login}\` repository=\`${a.repository}\` operation=\`${a.operation}\``,
+  ].join('\n');
+}
+
 // Assert the CLI was not handed an external --role/--principal override.
 // Launcher identity is hard-pinned; any attempted override must fail closed.
 export function assertNoRoleOverride(flags) {
