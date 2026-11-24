@@ -262,6 +262,84 @@ export function prIdentityViolations(pr, expected = {}) {
   return violations;
 }
 
+// R3 — per-repo GitHub accessor. Control-repo (config.issueRepository)
+// operations bind the control/write App token; product repos keep the primary
+// product token (unchanged).
+export function repoAccess(config, repo) {
+  return repo.isControlRepo ? controlGh : productGh;
+}
+
+export const PR_JSON_FIELDS = 'number,url,headRefOid,headRefName,baseRefName,state';
+
+// Parse `owner/repo` from a GitHub PR URL. Used to validate the API-returned PR
+// against the pinned repository instead of trusting a caller-assigned field.
+export function prRepositoryFromUrl(url) {
+  const match = /^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/pull\/\d+(?:\/)?(?:[?#].*)?$/.exec(url ?? '');
+  return match?.[1] ?? null;
+}
+
+// R3 — binding record persisted by `bind` (and by `submit` for product PRs).
+// Every identity field comes from the API response, never from flags, so
+// `findPr` can pin repository / number / base / head branch / HEAD SHA.
+export function bindingRecord(pr, identity = {}, now = new Date().toISOString()) {
+  return {
+    prNumber: pr.number,
+    prUrl: pr.url,
+    prBranch: pr.headRefName,
+    prBase: pr.baseRefName,
+    prHeadSha: pr.headRefOid,
+    boundAt: now,
+    boundBy: identity.principal ?? null,
+    boundWriter: identity.writeTokenBot ?? identity.tokenBot ?? null,
+  };
+}
+
+// R3 — resolve the PR for an issue + repo. Two modes:
+//   1. Explicit binding (state.prNumber): used by control-repo release PRs and
+//      by product PRs after `submit`. Fetches the pinned PR and fails closed on
+//      any repository / number / base / head branch / HEAD SHA mismatch.
+//      requireOpen defaults to true for the control repo (release PRs are only
+//      actionable while OPEN); merged-PR consumers (autoVerify) pass false.
+//   2. Branch inference (product repos without a binding): unchanged legacy
+//      behavior keyed on issue-pilot/<n>-<slug>; multiple open PRs fail closed.
+// `opts.gh` injects a fake gh runner for tests.
+export function findPr(config, repo, number, item, state, opts = {}) {
+  const gh = opts.gh ?? repoAccess(config, repo);
+
+  if (state?.prNumber != null) {
+    const pr = JSON.parse(gh(['pr', 'view', String(state.prNumber), '-R', repo.github,
+      '--json', PR_JSON_FIELDS]).stdout);
+    const repository = prRepositoryFromUrl(pr.url);
+    const violations = prIdentityViolations({ ...pr, repository }, {
+      repository: repo.github,
+      number: state.prNumber,
+      base: state.prBase ?? repo.base,
+      head: state.prBranch ?? null,
+      sha: state.prHeadSha ?? null,
+    });
+    if (violations.length) fail(`PR 身份校验失败（fail-closed）：\n- ${violations.join('\n- ')}`);
+    const requireOpen = opts.requireOpen ?? repo.isControlRepo;
+    if (requireOpen && pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+    return { ...pr, repository: repo.github };
+  }
+
+  if (repo.isControlRepo) {
+    fail(`控制仓 ${repo.github} 的 Issue #${number} 未绑定 PR（fail-closed）。\n`
+      + '请先执行显式绑定（PR 号见发布 PR）：\n'
+      + `  npm run pilot -- bind ${number} --pr <PR_NUMBER> --branch <HEAD_BRANCH> --base ${repo.base} --sha <HEAD_SHA>`);
+  }
+
+  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
+  const out = gh(['pr', 'list', '-R', repo.github, '--head', branch,
+    '--state', 'all', '--json', PR_JSON_FIELDS], { allowFailure: true });
+  const prs = JSON.parse(out.stdout || '[]');
+  const open = prs.filter((pr) => pr.state === 'OPEN');
+  if (open.length > 1) fail(`PR 歧义：分支 \`${branch}\` 有 ${open.length} 个开放 PR（需显式绑定 prNumber）`);
+  const pr = open[0] ?? prs[0] ?? null;
+  if (pr) pr.repository = repo.github;
+  return pr;
+}
+
 export function issue(config, number) {
   const text = controlGh([
     'issue', 'view', String(number), '-R', config.issueRepository,

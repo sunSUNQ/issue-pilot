@@ -2,10 +2,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
-  detectOwnerTransfer, ensurePathOnD, fail, isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
+  assertNoRoleOverride, assertSingleAssignee, auditFooter, bindingRecord, controlGh,
+  detectOwnerTransfer, ensurePathOnD, fail, findPr, isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
   loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
-  parseArgs, prIdentityViolations, productGh, repoAliasOf, repoDescriptor,
+  parseArgs, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
+  repoAccess, repoAliasOf, repoDescriptor,
   requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
   saveState, setNeed, setStatus, slugify, soloMode, statePath,
   validReviewerLgtm, verifyLauncherIdentity, worktreePath,
@@ -35,6 +36,7 @@ function usage() {
   approve <issue>
   run <issue>
   submit <issue>
+  bind <issue> --pr <n> [--branch <head>] [--base <base>] [--sha <commit>]
   ci <issue>
   review <issue> --verdict <lgtm|changes|blocked> --sha <commit> [--note <text>]
   merge <issue> --verdict <merge|rework> [--reason <text>]
@@ -263,15 +265,85 @@ function submit(config, number) {
   setNeed(config, number, 'author');
   const branchName = run('git', ['-C', target, 'branch', '--show-current']).stdout;
   const headNow = run('git', ['-C', target, 'rev-parse', 'HEAD']).stdout;
+  // B1：submit 创建 PR 后自动写入显式绑定，供 findPr 校验 PR 身份与 HEAD SHA。
+  const prNumber = Number(/\/pull\/(\d+)\s*$/.exec(pr)?.[1] ?? 0);
+  const binding = Number.isInteger(prNumber) && prNumber > 0
+    ? bindingRecord(
+      { number: prNumber, url: pr, headRefName: branchName, baseRefName: repo.base, headRefOid: headNow },
+      { principal: process.env.PL_PRINCIPAL ?? null, writeTokenBot: process.env.PL_WRITE_TOKEN_BOT ?? null },
+    )
+    : {};
   saveState(config, alias, number, {
-    prUrl: pr, head: headNow, branch: branchName,
+    prUrl: pr, head: headNow, branch: branchName, ...binding,
     submittedAt: new Date().toISOString(),
     launcherRole: process.env.PL_ROLE || null,
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
+  const bound = binding.prNumber ? `\n\n已写入显式绑定：PR #${binding.prNumber} @ \`${headNow.slice(0, 12)}\`。` : '';
   controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-    '--body', `PR 已提交：${pr}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。${auditFooter(config, 'submit')}`]);
+    '--body', `PR 已提交：${pr}${bound}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。${auditFooter(config, 'submit')}`]);
   console.log(pr);
+}
+
+// B1：显式 Issue ↔ PR 绑定。以有权限的 token 读回 PR，校验
+// repository / number / base / head branch / HEAD SHA / OPEN 后写入 state，
+// 并在 Issue 留可审计绑定评论（state 为机器本地，评论使其可重建）。
+function bind(config, number, flags) {
+  assertNoRoleOverride(flags);
+  const identity = verifyLauncherIdentity(process.env);
+  if (identity.role !== 'worker' && identity.role !== 'owner') {
+    fail('bind 仅限 author（worker）或 owner（reviewer 不得建立绑定）');
+  }
+  const prNumber = Number(flags.pr);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) fail('bind 需要 --pr <PR 号>。');
+
+  const item = issue(config, number);
+  if (item.state !== 'OPEN') fail(`Issue #${number} 状态 ${item.state}，不能绑定。`);
+  const alias = repoAliasOf(item, config);
+  const repo = repoDescriptor(config, alias);
+
+  const pr = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(prNumber), '-R', repo.github,
+    '--json', PR_JSON_FIELDS]).stdout);
+  const apiRepository = prRepositoryFromUrl(pr.url);
+  // 先校验失败条件，再校验 OPEN；任一不符都 fail-closed，不写 state。
+  const violations = prIdentityViolations({ ...pr, repository: apiRepository }, {
+    repository: repo.github,
+    number: prNumber,
+    base: flags.base ?? repo.base,
+    head: flags.branch ?? null,
+    sha: flags.sha ?? null,
+  });
+  if (violations.length) fail(`PR 身份校验失败（fail-closed）：\n- ${violations.join('\n- ')}`);
+  if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}（仅 OPEN 可绑定）`);
+
+  const previous = loadState(config, alias, number);
+  const unchanged = previous.prNumber === pr.number
+    && previous.prBranch === pr.headRefName
+    && previous.prBase === pr.baseRefName
+    && previous.prHeadSha === pr.headRefOid;
+  if (unchanged) {
+    console.log(`#${number} ↔ PR #${pr.number} 绑定未变化（${pr.headRefOid.slice(0, 12)}）`);
+    return;
+  }
+
+  const record = bindingRecord(pr, identity);
+  saveState(config, alias, number, record);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', [
+    '## Issue ↔ PR 显式绑定',
+    '',
+    `- repository：\`${repo.github}\``,
+    `- PR：#${pr.number} ${pr.url}`,
+    `- base：\`${pr.baseRefName}\``,
+    `- head：\`${pr.headRefName}\``,
+    `- HEAD SHA：\`${pr.headRefOid}\``,
+    `- state：${pr.state}`,
+    `- bound_by：\`${identity.principal}\``,
+    `- bound_writer：\`${identity.writeTokenBot ?? identity.tokenBot}\``,
+    '',
+    '`findPr` 将按上述字段校验；HEAD 变化后需重新 `bind`。',
+    auditFooter(config, 'bind'),
+  ].join('\n')]);
+  console.log(`#${number} ↔ PR #${pr.number} 已绑定（${pr.headRefOid.slice(0, 12)}）`);
 }
 
 // 三态标签转换表（design §5-8，设置与清除并重，防状态残留）。
@@ -527,15 +599,18 @@ function merge(config, number, flags) {
 
   if (verdict === 'merge') {
     if (failures.length) fail(`merge 四门重检失败：\n- ${failures.join('\n- ')}`);
-    if (repo.isControlRepo) {
-      // R3：控制仓发布 PR 的物理合并需 Contents/Pulls:Write on issue-pilot，
-      // 七 App 中无任何 role token 具备该权限；由 Repo Owner 或 Release Publisher
-      // App 显式执行（App-only，不绕过门禁，不直接 merge main）。
-      fail(`控制仓发布 PR 的物理合并超出七 App 权限范围：请由 Repo Owner 或 `
-        + `Release Publisher（pl-release-publisher[bot]）在确认 LGTM + CI 全绿 + gate 0 命中后显式合并。`
-        + `\n四门重检已通过：\n- LGTM（reviewer）：${lgtm.review_id}\n- HEAD：\`${headSha.slice(0, 12)}\``);
+    // Owner 裁定：控制仓 merge 走 CLI（pl-owner-control-write 需 Contents:Write /
+    // Pull requests:Write）。权限未生效时 GitHub 拒绝写入，此处 fail-closed，
+    // 不提供任何替代身份/人工合并旁路。
+    const mergeCall = repoAccess(config, repo)(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge'],
+      { allowFailure: true });
+    if (mergeCall.status !== 0) {
+      const hint = repo.isControlRepo
+        ? '控制仓 CLI merge 未获授权（fail-closed）：需 Owner 为 pl-owner-control-write 授予 '
+          + 'Contents:Write / Pull requests:Write 并留 permission readback（见 Issue #101 B2/B4）。'
+        : 'PR merge 失败（fail-closed）。';
+      fail(`${hint}\n${(mergeCall.stderr || mergeCall.stdout || `exit ${mergeCall.status}`).trim()}`);
     }
-    repoAccess(config, repo)(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
     const merged = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(pr.number), '-R', repo.github,
       '--json', 'mergeCommit,state']).stdout);
     const mergedSha = merged.mergeCommit?.oid ?? null;
@@ -660,53 +735,6 @@ function autoApprove(config, item) {
   return null;
 }
 
-// R3 token routing：控制仓（repo.isControlRepo）的 PR/check-runs/rulesets 读写绑定
-// 控制写侧 App token（controlGh）；产品仓保持主 product token（productGh），路由不变。
-function repoAccess(config, repo) {
-  return repo.isControlRepo ? controlGh : productGh;
-}
-
-const PR_JSON_FIELDS = 'number,url,headRefOid,headRefName,baseRefName,state';
-
-// R3 — resolve the PR for an issue + repo. Two modes:
-//   1. Explicit binding（控制仓发布 / 任意显式绑定）：state.prNumber 钉扎 PR，
-//      取回后做身份唯一性校验（repository / number / base / head branch / 可选 SHA）。
-//   2. Branch inference（产品仓，行为不变）：按 issue-pilot/<n>-<slug> 分支列 PR，
-//      多开放 PR 歧义时 fail-closed（需显式绑定）。
-// 返回 PR 对象（含 repository 字段）或 null（未找到，由调用方失败并说明）。
-function findPr(config, repo, number, item, state) {
-  const gh = repoAccess(config, repo);
-
-  if (repo.isControlRepo) {
-    if (state?.prNumber == null) {
-      fail(`控制仓发布 PR 需显式绑定（state.prNumber），记录 Issue↔PR 绑定后重试。`);
-    }
-    const pr = JSON.parse(gh(['pr', 'view', String(state.prNumber), '-R', repo.github,
-      '--json', PR_JSON_FIELDS]).stdout);
-    pr.repository = repo.github;
-    const violations = prIdentityViolations(pr, {
-      repository: repo.github,
-      number: state.prNumber,
-      base: state.prBase ?? repo.base,
-      head: state.prBranch ?? null,
-      sha: state.prHeadSha ?? null,
-    });
-    if (violations.length) fail(`PR 身份校验失败（fail-closed）：\n- ${violations.join('\n- ')}`);
-    if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
-    return pr;
-  }
-
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const out = gh(['pr', 'list', '-R', repo.github, '--head', branch,
-    '--state', 'all', '--json', PR_JSON_FIELDS], { allowFailure: true });
-  const prs = JSON.parse(out.stdout || '[]');
-  const open = prs.filter((pr) => pr.state === 'OPEN');
-  if (open.length > 1) fail(`PR 歧义：分支 \`${branch}\` 有 ${open.length} 个开放 PR（需显式绑定 prNumber）`);
-  const pr = open[0] ?? prs[0] ?? null;
-  if (pr) pr.repository = repo.github;
-  return pr;
-}
-
 function gateAudit(config, repo, prNumber) {
   const gh = repoAccess(config, repo);
   const files = JSON.parse(gh(['pr', 'view', String(prNumber), '-R', repo.github,
@@ -774,7 +802,8 @@ function autoMerge(config, item, alias, repo, state) {
 
 function autoVerify(config, item, alias, repo, state) {
   const number = item.number;
-  const found = findPr(config, repo, number, item, state);
+  // 合并后的 PR 不再是 OPEN；绑定身份校验仍然生效。
+  const found = findPr(config, repo, number, item, state, { requireOpen: false });
   if (!found) return '未找到 PR';
   const view = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(found.number), '-R', repo.github,
     '--json', 'state,mergeCommit,url']).stdout);
@@ -855,7 +884,8 @@ function advanceOnce(config, number) {
         return { progress: false, reason: '无 commit（实现中）' };
       }
       submit(config, number);
-      const pr = findPr(config, repo, number, item, state);
+      // submit 写入绑定后必须重读 state，否则本次 findPr 仍用旧 state。
+      const pr = findPr(config, repo, number, item, loadState(config, alias, number));
       saveState(config, alias, number, {
         prUrl: pr?.url, head: pr?.headRefOid,
         submittedAt: new Date().toISOString(),
@@ -919,6 +949,7 @@ try {
     else if (command === 'approve') approve(config, requireNumber(positionals[0]));
     else if (command === 'run') startRun(config, requireNumber(positionals[0]));
     else if (command === 'submit') submit(config, requireNumber(positionals[0]));
+    else if (command === 'bind') bind(config, requireNumber(positionals[0]), flags);
     else if (command === 'ci') ci(config, requireNumber(positionals[0]));
     else if (command === 'review') review(config, requireNumber(positionals[0]), flags);
     else if (command === 'merge') merge(config, requireNumber(positionals[0]), flags);

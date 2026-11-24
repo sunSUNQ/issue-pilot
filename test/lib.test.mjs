@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
-  auditFooter, controlRepoAlias, isApprovedReleaseGateFile, labelsOf, mintAppToken, missingRequiredChecks,
-  outstandingBlocks, parseArgs, prIdentityViolations, repoAliasOf, repoDescriptor, requiredChecksFromRuleset,
+  auditFooter, bindingRecord, controlRepoAlias, findPr, isApprovedReleaseGateFile, labelsOf, mintAppToken,
+  missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
+  repoAliasOf, repoDescriptor, requiredChecksFromRuleset,
   slugify, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
 
@@ -503,4 +504,162 @@ test('R3 prIdentityViolations flags repository / number / base / head / sha mism
 test('R3 prIdentityViolations ignores unpinned fields (optional binding)', () => {
   const v = prIdentityViolations(R3_PR, { number: 103 });
   assert.deepEqual(v, []);
+});
+
+// --- B1: explicit Issue ↔ PR binding + findPr control-repo branch ---
+
+const B1_PR = {
+  number: 103,
+  url: 'https://github.com/sunSUNQ/issue-pilot/pull/103',
+  headRefOid: '142c8e90399981c3b08b8a019fc70e9185e2943d',
+  headRefName: 'governance-v2-release-candidate',
+  baseRefName: 'main',
+  state: 'OPEN',
+};
+
+const B1_STATE = {
+  prNumber: 103,
+  prBranch: 'governance-v2-release-candidate',
+  prBase: 'main',
+  prHeadSha: B1_PR.headRefOid,
+};
+
+function ghStub(payload, calls = []) {
+  return (args) => {
+    calls.push(args);
+    return { status: 0, stdout: JSON.stringify(payload), stderr: '' };
+  };
+}
+
+test('B1 prRepositoryFromUrl parses owner/repo from a PR URL only', () => {
+  assert.equal(prRepositoryFromUrl('https://github.com/sunSUNQ/issue-pilot/pull/103'), 'sunSUNQ/issue-pilot');
+  assert.equal(prRepositoryFromUrl('https://github.com/sunSUNQ/issue-pilot/pull/103/'), 'sunSUNQ/issue-pilot');
+  assert.equal(prRepositoryFromUrl('https://github.com/sunSUNQ/issue-pilot/issues/103'), null);
+  assert.equal(prRepositoryFromUrl(''), null);
+});
+
+test('B1 bindingRecord persists repository identity fields from the API response', () => {
+  const record = bindingRecord(B1_PR, { principal: 'pl-issue-worker[bot]', writeTokenBot: 'pl-worker-control-write[bot]' }, 'T0');
+  assert.deepEqual(record, {
+    prNumber: 103,
+    prUrl: B1_PR.url,
+    prBranch: 'governance-v2-release-candidate',
+    prBase: 'main',
+    prHeadSha: B1_PR.headRefOid,
+    boundAt: 'T0',
+    boundBy: 'pl-issue-worker[bot]',
+    boundWriter: 'pl-worker-control-write[bot]',
+  });
+});
+
+test('B1 findPr fails closed with an executable bind command when the control repo has no binding', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101, title: 'release' }, {}),
+    (error) => /未绑定 PR/.test(error.message)
+      && /npm run pilot -- bind 101 --pr <PR_NUMBER>/.test(error.message),
+  );
+});
+
+test('B1 findPr resolves the bound control-repo PR and pins its repository', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  const calls = [];
+  const pr = findPr(R3_CFG, repo, 101, { number: 101, title: 'release' }, B1_STATE, { gh: ghStub(B1_PR, calls) });
+  assert.equal(pr.number, 103);
+  assert.equal(pr.repository, 'sunSUNQ/issue-pilot');
+  assert.equal(pr.headRefOid, B1_PR.headRefOid);
+  assert.deepEqual(calls[0].slice(0, 5), ['pr', 'view', '103', '-R', 'sunSUNQ/issue-pilot']);
+});
+
+test('B1 findPr rejects a bound PR whose number differs', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101 }, B1_STATE, { gh: ghStub({ ...B1_PR, number: 999 }) }),
+    /!= 期望 PR #103/,
+  );
+});
+
+test('B1 findPr rejects a bound PR from another repository (URL is authoritative)', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101 }, B1_STATE,
+      { gh: ghStub({ ...B1_PR, url: 'https://github.com/other/repo/pull/103' }) }),
+    /不属于仓库 sunSUNQ\/issue-pilot/,
+  );
+});
+
+test('B1 findPr rejects bound base / head branch / HEAD SHA mismatches', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101 }, { ...B1_STATE, prBase: 'develop' }, { gh: ghStub(B1_PR) }),
+    /base main != 期望 develop/,
+  );
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101 }, { ...B1_STATE, prBranch: 'other-branch' }, { gh: ghStub(B1_PR) }),
+    /head branch governance-v2-release-candidate != 期望 other-branch/,
+  );
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101 }, { ...B1_STATE, prHeadSha: 'deadbeef' }, { gh: ghStub(B1_PR) }),
+    /HEAD 142c8e90.* != 期望 deadbeef/,
+  );
+});
+
+test('B1 findPr rejects a bound control-repo PR that is not OPEN', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  assert.throws(
+    () => findPr(R3_CFG, repo, 101, { number: 101 }, B1_STATE, { gh: ghStub({ ...B1_PR, state: 'MERGED' }) }),
+    /状态 MERGED/,
+  );
+});
+
+test('B1 merged-PR consumers can opt out of the OPEN requirement', () => {
+  const repo = repoDescriptor(R3_CFG, 'issue-pilot');
+  const pr = findPr(R3_CFG, repo, 101, { number: 101 }, B1_STATE,
+    { gh: ghStub({ ...B1_PR, state: 'MERGED' }), requireOpen: false });
+  assert.equal(pr.state, 'MERGED');
+});
+
+test('B1 product-repo binding uses the explicit PR instead of branch inference', () => {
+  const repo = repoDescriptor(R3_CFG, 'tasco');
+  const payload = {
+    number: 7,
+    url: 'https://github.com/sunSUNQ/tasco-dev/pull/7',
+    headRefOid: 'feedface',
+    headRefName: 'issue-pilot/55-fix',
+    baseRefName: 'main',
+    state: 'MERGED',
+  };
+  const calls = [];
+  const pr = findPr(R3_CFG, repo, 55, { number: 55, title: 'fix' },
+    { prNumber: 7, prBranch: 'issue-pilot/55-fix', prBase: 'main', prHeadSha: 'feedface' },
+    { gh: ghStub(payload, calls) });
+  assert.equal(pr.number, 7);
+  assert.equal(pr.repository, 'sunSUNQ/tasco-dev');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], 'pr');
+  assert.equal(calls[0][1], 'view');
+});
+
+test('B1 product-repo without a binding keeps branch inference unchanged', () => {
+  const repo = repoDescriptor(R3_CFG, 'tasco');
+  const calls = [];
+  const pr = findPr(R3_CFG, repo, 55, { number: 55, title: 'Fix Parser' }, {}, {
+    gh: (args) => {
+      calls.push(args);
+      return { status: 0, stdout: JSON.stringify([{ number: 9, url: 'https://github.com/sunSUNQ/tasco-dev/pull/9', state: 'OPEN' }]), stderr: '' };
+    },
+  });
+  assert.equal(pr.number, 9);
+  assert.equal(pr.repository, 'sunSUNQ/tasco-dev');
+  assert.ok(calls[0].includes('issue-pilot/55-fix-parser'));
+});
+
+test('B1 branch inference still fails closed on ambiguous open PRs', () => {
+  const repo = repoDescriptor(R3_CFG, 'tasco');
+  assert.throws(
+    () => findPr(R3_CFG, repo, 55, { number: 55, title: 'fix' }, {}, {
+      gh: () => ({ status: 0, stdout: JSON.stringify([{ number: 1, state: 'OPEN' }, { number: 2, state: 'OPEN' }]), stderr: '' }),
+    }),
+    /PR 歧义/,
+  );
 });
