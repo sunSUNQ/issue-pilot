@@ -2,9 +2,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  ensurePathOnD, fail, issue, labelsOf, loadConfig, loadState,
-  missingAutoElements, parseArgs, repoAliasOf, root, run, runShell, saveState,
-  setNeed, setStatus, slugify, soloMode, statePath, worktreePath,
+  assertNoRoleOverride, assertSingleAssignee, auditFooter, bindingRecord, controlGh,
+  detectOwnerTransfer, ensurePathOnD, fail, findPr, isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
+  loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
+  parseArgs, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
+  repoAccess, repoAliasOf, repoDescriptor,
+  requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
+  saveState, setNeed, setStatus, slugify, soloMode, statePath,
+  validReviewerLgtm, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -16,7 +21,7 @@ const TYPE_COLORS = {
   bug: 'D73A4A', maintenance: 'C5DEF5', research: '7057FF',
   feature: 'A2EEEF', decision: 'F9D0C4',
 };
-const NEED_COLORS = { author: 'FBCA04', reviewer: '1D76DB', owner: 'D93F0B' };
+const NEED_COLORS = { author: 'FBCA04', reviewer: '1D76DB', 'issue-owner': 'D93F0B', 'repo-owner': 'B60205' };
 
 function usage() {
   console.log(`Issue Pilot
@@ -27,20 +32,26 @@ function usage() {
   search <keywords>
   repo list
   repo add <alias> --path <local> --github <owner/repo> [--base main] [--policy name]
-  propose --repo <alias> --type <type> --title <text> --body-file <path>
+  propose --repo <alias> --type <type> --title <text> --body-file <path> --assignee <owner-login>
   approve <issue>
   run <issue>
   submit <issue>
-  review <issue> --verdict <lgtm|changes> --sha <commit>
+  bind <issue> --pr <n> [--branch <head>] [--base <base>] [--sha <commit>]
+  ci <issue>
+  review <issue> --verdict <lgtm|changes|blocked> --sha <commit> [--note <text>]
+  merge <issue> --verdict <merge|rework> [--reason <text>]
   verify <issue> --evidence-file <path>
   close <issue> --summary-file <path>
   advance <issue>       Solo Mode 幂等单步自动推进
   autopilot <issue>     Solo Mode 循环推进至 hold/closed/无进展
 
 Labels: status:* lifecycle · type:* kind · need:* next actor
-(author / reviewer / owner). brief groups by need:*.
+(author / reviewer / issue-owner / repo-owner). brief groups by need:*.
+need:issue-owner = Issue Owner（立项/批准/verify/close）；
+need:repo-owner = Repo Owner（唯一 merge 门）。
 
-Owner-only: approve, merge, release. Agent-created work starts as candidate.`);
+Owner-only: approve, verify, close（Issue Owner，按 assignee 路由）,
+merge（Repo Owner）。Agent-created work starts as candidate.`);
 }
 
 function requireNumber(value) {
@@ -98,17 +109,19 @@ function setup(config) {
     ['review:lgtm', '0E8A16'], ['preflight', 'FEF2C0'],
   ];
   for (const [name, color] of labels) {
-    run('gh', ['label', 'create', name, '-R', config.issueRepository, '--color', color, '--force']);
+    controlGh(['label', 'create', name, '-R', config.issueRepository, '--color', color, '--force']);
   }
-  console.log(`已同步 ${labels.length} 个 labels 到 ${config.issueRepository}`);
+  // 一次性迁移：删除旧 need:owner（已拆分 need:issue-owner / need:repo-owner）
+  controlGh(['label', 'delete', 'need:owner', '-R', config.issueRepository, '--yes'], { allowFailure: true });
+  console.log(`已同步 ${labels.length} 个 labels 到 ${config.issueRepository}（need:owner 已删除）`);
 }
 
 function brief(config, mine) {
   const fields = 'number,title,labels,assignees,updatedAt,url,author';
   const args = ['issue', 'list', '-R', config.issueRepository, '--state', 'open', '--limit', '100', '--json', fields];
   if (mine) args.push('--assignee', '@me');
-  const issues = JSON.parse(run('gh', args).stdout);
-  const order = ['need:owner', 'need:reviewer', 'need:author', 'other'];
+  const issues = JSON.parse(controlGh(args).stdout);
+  const order = ['need:issue-owner', 'need:repo-owner', 'need:reviewer', 'need:author', 'other'];
   const groups = new Map(order.map((status) => [status, []]));
   for (const item of issues) {
     const need = labelsOf(item).find((label) => label.startsWith('need:')) ?? 'other';
@@ -128,7 +141,7 @@ function brief(config, mine) {
 
 function search(config, keywords) {
   if (!keywords) fail('search 需要关键词。');
-  const out = run('gh', ['issue', 'list', '-R', config.issueRepository, '--state', 'all', '--search', keywords, '--limit', '50']);
+  const out = controlGh(['issue', 'list', '-R', config.issueRepository, '--state', 'all', '--search', keywords, '--limit', '50']);
   console.log(out.stdout || '没有匹配 Issue。');
 }
 
@@ -166,22 +179,31 @@ function propose(config, flags) {
   if (!repo || !config.repositories[repo]) fail('propose 需要已注册的 --repo。');
   if (!TYPE_COLORS[type]) fail(`不支持的 --type：${type}`);
   if (!title || !flags['body-file']) fail('propose 需要 --title 和 --body-file。');
+  // Issue Owner：assignee = Issue Owner（生命周期负责人），不得用命令执行者
+  // 的 App bot（@me / 控制写侧 bot）自动充当；未显式指定 → fail-closed。
+  const assignee = requireIssueOwner(flags.assignee);
   const bodyPath = path.resolve(flags['body-file']);
   if (!fs.existsSync(bodyPath)) fail(`正文文件不存在：${bodyPath}`);
-  const result = run('gh', [
+  const result = controlGh([
     'issue', 'create', '-R', config.issueRepository, '--title', title,
     '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo}`,
+    '--assignee', assignee,
   ]);
-  setNeed(config, Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0), 'owner');
+  const number = Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0);
+  setNeed(config, number, 'issue-owner');
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+    '--body', `Issue 创建（propose）。${auditFooter(config, 'propose')}`]);
   console.log(result.stdout);
 }
 
 function approve(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') fail(`Issue #${number} 不是 OPEN。`);
+  assertSingleAssignee(item);   // 决策④：0/多值 assignee 阻止 approve
+  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   setStatus(config, number, 'approved');
   setNeed(config, number, 'author');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', 'Owner gate：批准进入实现。']);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `Owner gate：批准进入实现。${auditFooter(config, 'approve')}`]);
   console.log(`#${number} -> approved`);
 }
 
@@ -189,7 +211,7 @@ function startRun(config, number) {
   const item = issue(config, number);
   if (!labelsOf(item).includes('status:approved')) fail(`#${number} 尚未 approved。`);
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const target = worktreePath(config, alias, number);
   ensurePathOnD(target);
   if (fs.existsSync(target)) fail(`worktree 已存在：${target}`);
@@ -200,15 +222,19 @@ function startRun(config, number) {
   run('git', ['-C', repo.path, 'worktree', 'add', '-b', branch, target, start]);
   setStatus(config, number, 'in-progress');
   setNeed(config, number, 'author');
-  const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\``;
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
+  saveState(config, alias, number, {
+    launcherRole: process.env.PL_ROLE || null,
+    githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
+  });
+  const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\`${auditFooter(config, 'run')}`;
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
   console.log(target);
 }
 
 function submit(config, number) {
   const item = issue(config, number);
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const target = worktreePath(config, alias, number);
   if (!fs.existsSync(target)) fail(`worktree 不存在：${target}`);
   const status = run('git', ['-C', target, 'status', '--porcelain']).stdout;
@@ -231,48 +257,380 @@ function submit(config, number) {
     '', '## 未改变的边界', '', `遵循 \`${repo.policy}\` policy；未授权范围保持不变。`,
     '', '## 风险与回滚', '', '可通过回退本 PR 恢复。',
   ].join('\n');
-  const pr = run('gh', [
+  const pr = productGh([
     'pr', 'create', '-R', repo.github, '--base', repo.base, '--head', branch,
     '--title', item.title.replace(/^\[候选\]\s*/, ''), '--body', body,
   ]).stdout;
-  setStatus(config, number, 'in-review');
-  setNeed(config, number, 'reviewer');
+  setStatus(config, number, 'in-progress');
+  setNeed(config, number, 'author');
   const branchName = run('git', ['-C', target, 'branch', '--show-current']).stdout;
   const headNow = run('git', ['-C', target, 'rev-parse', 'HEAD']).stdout;
+  // B1：submit 创建 PR 后自动写入显式绑定，供 findPr 校验 PR 身份与 HEAD SHA。
+  const prNumber = Number(/\/pull\/(\d+)\s*$/.exec(pr)?.[1] ?? 0);
+  const binding = Number.isInteger(prNumber) && prNumber > 0
+    ? bindingRecord(
+      { number: prNumber, url: pr, headRefName: branchName, baseRefName: repo.base, headRefOid: headNow },
+      { principal: process.env.PL_PRINCIPAL ?? null, writeTokenBot: process.env.PL_WRITE_TOKEN_BOT ?? null },
+    )
+    : {};
   saveState(config, alias, number, {
-    prUrl: pr, head: headNow, branch: branchName,
+    prUrl: pr, head: headNow, branch: branchName, ...binding,
     submittedAt: new Date().toISOString(),
+    launcherRole: process.env.PL_ROLE || null,
+    githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `PR 已提交：${pr}`]);
+  const bound = binding.prNumber ? `\n\n已写入显式绑定：PR #${binding.prNumber} @ \`${headNow.slice(0, 12)}\`。` : '';
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+    '--body', `PR 已提交：${pr}${bound}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。${auditFooter(config, 'submit')}`]);
   console.log(pr);
 }
 
-function review(config, number, flags) {
-  if (!['lgtm', 'changes'].includes(flags.verdict)) fail('--verdict 必须是 lgtm 或 changes。');
-  if (!flags.sha) fail('review 必须提供 --sha。');
+// B1：显式 Issue ↔ PR 绑定。以有权限的 token 读回 PR，校验
+// repository / number / base / head branch / HEAD SHA / OPEN 后写入 state，
+// 并在 Issue 留可审计绑定评论（state 为机器本地，评论使其可重建）。
+function bind(config, number, flags) {
+  assertNoRoleOverride(flags);
+  const identity = verifyLauncherIdentity(process.env);
+  if (identity.role !== 'worker' && identity.role !== 'owner') {
+    fail('bind 仅限 author（worker）或 owner（reviewer 不得建立绑定）');
+  }
+  const prNumber = Number(flags.pr);
+  if (!Number.isInteger(prNumber) || prNumber <= 0) fail('bind 需要 --pr <PR 号>。');
+
   const item = issue(config, number);
-  if (!labelsOf(item).includes('status:in-review')) fail(`#${number} 当前不在 in-review。`);
+  if (item.state !== 'OPEN') fail(`Issue #${number} 状态 ${item.state}，不能绑定。`);
   const alias = repoAliasOf(item, config);
-  const body = flags.verdict === 'lgtm'
-    ? `独立 review：LGTM，审查 commit \`${flags.sha}\`。`
-    : `独立 review：需要修改，审查 commit \`${flags.sha}\`。`;
-  const out = run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
-  if (flags.verdict === 'lgtm') {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', 'review:lgtm']);
-    setNeed(config, number, 'owner');
-    saveState(config, alias, number, { reviewUrl: out.stdout, reviewedSha: flags.sha });
-  } else {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { allowFailure: true });
+  const repo = repoDescriptor(config, alias);
+
+  const pr = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(prNumber), '-R', repo.github,
+    '--json', PR_JSON_FIELDS]).stdout);
+  const apiRepository = prRepositoryFromUrl(pr.url);
+  // 先校验失败条件，再校验 OPEN；任一不符都 fail-closed，不写 state。
+  const violations = prIdentityViolations({ ...pr, repository: apiRepository }, {
+    repository: repo.github,
+    number: prNumber,
+    base: flags.base ?? repo.base,
+    head: flags.branch ?? null,
+    sha: flags.sha ?? null,
+  });
+  if (violations.length) fail(`PR 身份校验失败（fail-closed）：\n- ${violations.join('\n- ')}`);
+  if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}（仅 OPEN 可绑定）`);
+
+  const previous = loadState(config, alias, number);
+  const unchanged = previous.prNumber === pr.number
+    && previous.prBranch === pr.headRefName
+    && previous.prBase === pr.baseRefName
+    && previous.prHeadSha === pr.headRefOid;
+  if (unchanged) {
+    console.log(`#${number} ↔ PR #${pr.number} 绑定未变化（${pr.headRefOid.slice(0, 12)}）`);
+    return;
+  }
+
+  const record = bindingRecord(pr, identity);
+  saveState(config, alias, number, record);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', [
+    '## Issue ↔ PR 显式绑定',
+    '',
+    `- repository：\`${repo.github}\``,
+    `- PR：#${pr.number} ${pr.url}`,
+    `- base：\`${pr.baseRefName}\``,
+    `- head：\`${pr.headRefName}\``,
+    `- HEAD SHA：\`${pr.headRefOid}\``,
+    `- state：${pr.state}`,
+    `- bound_by：\`${identity.principal}\``,
+    `- bound_writer：\`${identity.writeTokenBot ?? identity.tokenBot}\``,
+    '',
+    '`findPr` 将按上述字段校验；HEAD 变化后需重新 `bind`。',
+    auditFooter(config, 'bind'),
+  ].join('\n')]);
+  console.log(`#${number} ↔ PR #${pr.number} 已绑定（${pr.headRefOid.slice(0, 12)}）`);
+}
+
+// 三态标签转换表（design §5-8，设置与清除并重，防状态残留）。
+// setNeed 内部会清除所有 need:* 再设目标；review:lgtm 单独增删。
+function applyReviewLabels(config, number, verdict) {
+  if (verdict === 'lgtm') {
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', 'review:lgtm']);
+    setNeed(config, number, 'repo-owner');
+  } else if (verdict === 'changes') {
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { allowFailure: true });
     setStatus(config, number, 'in-progress');
     setNeed(config, number, 'author');
-    const state = loadState(config, alias, number);
-    const next = saveState(config, alias, number, {
-      reviewChangesCount: (state.reviewChangesCount ?? 0) + 1,
-      reviewUrl: out.stdout,
-    });
-    if (next.reviewChangesCount >= HOLD_REVIEW_CHANGES) {
-      hold(config, number, `复审 changes 达 ${next.reviewChangesCount} 轮`);
+  } else if (verdict === 'blocked') {
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', 'review:lgtm'], { allowFailure: true });
+    setNeed(config, number, 'reviewer');
+  }
+}
+
+function reviewCommentBody(verdict, record, blockedReason, note) {
+  const table = [
+    `| operation | ${record.operation} |`,
+    `| launcher_role | ${record.launcher_role} |`,
+    `| principal | ${record.principal ?? '(n/a)'} |`,
+    `| github_login | ${record.github_login ?? '(n/a)'} |`,
+    `| token_bot | ${record.token_bot ?? '(n/a)'} |`,
+    `| writer_login | ${record.writer_login ?? '(n/a)'} |`,
+    `| repository | ${record.repository} |`,
+    `| control_repository | ${record.control_repository} |`,
+    `| reviewer_verdict | ${record.reviewer_verdict} |`,
+    `| reviewed_head_sha | \`${record.reviewed_head_sha ?? '(none)'}\` |`,
+    `| reviewed_at | ${record.reviewed_at} |`,
+    `| review_id | ${record.review_id} |`,
+  ].join('\n');
+  const header = verdict === 'lgtm' ? '## 独立 review：LGTM'
+    : verdict === 'changes' ? '## 独立 review：CHANGES'
+      : '## 独立 review：BLOCKED';
+  const extra = verdict === 'blocked'
+    ? [`- 原因：${blockedReason ?? '前置条件未满足'}`, '', 'BLOCKED 不构成代码判定；修复环境后可重新 review。']
+    : [];
+  const noteLines = note ? ['', '## 审查证据', '', note] : [];
+  return [header, '', table, ...extra, ...noteLines].join('\n');
+}
+
+function review(config, number, flags) {
+  const requestedVerdict = flags.verdict;
+  if (!['lgtm', 'changes', 'blocked'].includes(requestedVerdict)) {
+    fail('--verdict 必须是 lgtm|changes|blocked。');
+  }
+  if (!flags.sha) fail('review 必须提供 --sha。');
+  assertNoRoleOverride(flags);
+
+  // 1. R7 身份校验（fail-closed，约束 6）
+  const identity = verifyLauncherIdentity(process.env);
+
+  // 2. 读 issue（控制仓 → 控制写侧 token；读 App 无控制仓 Issues 权限）
+  const item = issue(config, number);
+  if (!labelsOf(item).includes('status:in-review')) fail(`#${number} 当前不在 in-review。`);
+  const assignee = assertSingleAssignee(item);
+
+  // 3. R7 约束 1–4（审查资格）
+  if (identity.role === 'worker') fail('R7 约束1：Worker 不得执行 review');
+  if (identity.role === 'owner' && identity.principal === assignee) fail('R7 约束3：Issue Owner（assignee）不得自审');
+  if (identity.role === 'reviewer' && identity.principal === assignee) fail('R7 约束2：Issue Owner（assignee）不得自审');
+
+  // 4. 三态前置判定（消除 SHA 循环依赖）：ciHeadSha / PR head / --sha
+  const alias = repoAliasOf(item, config);
+  const repo = repoDescriptor(config, alias);
+  const state = loadState(config, alias, number);
+  const ciHeadSha = state.ciHeadSha;
+  const pr = findPr(config, repo, number, item, state);
+  if (!pr) fail('未找到开放 PR');
+  const prHead = pr.headRefOid;
+
+  let verdict = requestedVerdict;
+  let blockedReason = null;
+  if (!ciHeadSha) {
+    verdict = 'blocked';
+    blockedReason = '无 ciHeadSha（尚未跑 ci 或 CI 未全绿）';
+  } else if (prHead !== ciHeadSha) {
+    verdict = 'blocked';
+    blockedReason = `PR head ${prHead.slice(0, 8)} != ciHeadSha ${ciHeadSha.slice(0, 8)}（HEAD 已变，需重跑 ci）`;
+  } else if (flags.sha !== ciHeadSha) {
+    verdict = 'blocked';
+    blockedReason = `--sha ${flags.sha.slice(0, 8)} != ciHeadSha ${ciHeadSha.slice(0, 8)}`;
+  }
+
+  const headForReview = ciHeadSha || prHead;
+  const reviewId = `${number}:${pr.number}:${headForReview}:${identity.principal}:${verdict}`;
+  const record = {
+    review_id: reviewId,
+    operation: 'review',
+    launcher_role: identity.role,
+    principal: identity.principal,
+    github_login: identity.githubLogin,
+    token_bot: identity.tokenBot,
+    writer_login: identity.writeTokenBot ?? identity.tokenBot,
+    repository: repo.github,
+    control_repository: config.issueRepository,
+    reviewer_verdict: verdict,
+    // P1-2：BLOCKED 也绑定到当前待审 SHA，使后续 BLOCKED 能失效同 SHA 的旧 LGTM。
+    reviewed_head_sha: headForReview,
+    reviewed_at: new Date().toISOString(),
+    review_url: null,
+  };
+
+  // 5. 幂等（state 先行；review_id = issue+PR+head_sha+reviewer+verdict）
+  const reviews = state.reviews ?? [];
+  const existing = reviews.find((r) => r.review_id === reviewId);
+  if (existing && existing.review_url) {
+    // E26：评论已写、标签可能失败 → 仅补标签，不重复写评论
+    applyReviewLabels(config, number, verdict);
+    console.log(`#${number} review 幂等（评论已存在，仅补标签）`);
+    return;
+  }
+
+  // 6. 写 state 先行（记录 review 记录，review_url 待补）
+  let nextReviews;
+  if (existing) nextReviews = reviews.map((r) => (r.review_id === reviewId ? record : r));
+  else nextReviews = [...reviews, record];
+  saveState(config, alias, number, { reviews: nextReviews });
+
+  // 7. 写评论（控制写侧 token）
+  const body = reviewCommentBody(verdict, record, blockedReason, flags.note);
+  const commentOut = controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
+
+  // 8. 回填 review_url
+  const withUrl = nextReviews.map((r) => (r.review_id === reviewId ? { ...r, review_url: commentOut.stdout } : r));
+  saveState(config, alias, number, { reviews: withUrl });
+
+  // 9. 派生标签（派生前重读，幂等应用）
+  applyReviewLabels(config, number, verdict);
+
+  console.log(`#${number} -> ${verdict}${blockedReason ? `（${blockedReason}）` : ''}`);
+}
+
+// ---------------------------------------------------------------------------
+// CI Gate（design §6）：Required Checks 权威来源 + canEnterReview 三分匹配
+// ---------------------------------------------------------------------------
+
+// getRequiredChecks(repo, base) -> [{ context, integration_id|null }]
+// Rulesets + Branch Protection 双查取并集，key=(context, integration_id) 去重。
+// 空并集或 Rulesets 不可读 → fail-closed；BP 404 属预期（跳过）。
+function getRequiredChecks(config, repo, base) {
+  const required = [];
+  const seen = new Set();
+  const add = (context, integrationId) => {
+    const key = `${context}\u0000${integrationId ?? ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    required.push({ context, integration_id: integrationId ?? null });
+  };
+
+  const gh = repoAccess(config, repo);
+
+  // 1) Rulesets（现代权威来源）。LIST 端点仅返回摘要（无 rules/conditions），
+  // 需逐 id 取 DETAIL，再由 requiredChecksFromRuleset 提取必检项。
+  const rsList = JSON.parse(gh(['api', `repos/${repo.github}/rulesets`]).stdout);
+  for (const summary of rsList) {
+    const rs = JSON.parse(gh(['api', `repos/${repo.github}/rulesets/${summary.id}`]).stdout);
+    for (const check of requiredChecksFromRuleset(rs, base)) {
+      add(check.context, check.integration_id);
     }
+  }
+
+  // 2) 传统 Branch Protection（404 预期跳过；403/500 等 fail-closed）
+  const bp = gh(['api', `repos/${repo.github}/branches/${base}/protection`], { allowFailure: true });
+  if (bp.status === 0) {
+    const data = JSON.parse(bp.stdout);
+    for (const ctx of data.required_status_checks?.contexts ?? []) add(ctx, null);
+    for (const chk of data.required_status_checks?.checks ?? []) add(chk.context, chk.app_id ?? null);
+  } else if (!/404/i.test(`${bp.stderr}${bp.stdout}`)) {
+    fail(`Branch Protection 不可读（fail-closed）：${bp.stderr || `exit ${bp.status}`}`);
+  }
+
+  // 3) 并集为空 → fail-closed（G4/G10）
+  if (required.length === 0) fail('Required Checks 为空（fail-closed，G4）');
+  return required;
+}
+
+// canEnterReview(pr)：Check Runs 与 Commit Status 分别匹配（字段不同，不混用）。
+// G10：重复 check 聚合下沉为纯函数 missingRequiredChecks，按
+// (context, integration_id) 取最新有效记录，重跑 / 顺序 / 同名异 App
+// 均 fail-closed 且确定。
+function canEnterReview(config, repo, base, headSha) {
+  const required = getRequiredChecks(config, repo, base);
+  const gh = repoAccess(config, repo);
+  const checkRuns = JSON.parse(gh(['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
+  const statuses = JSON.parse(gh(['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
+  const missing = missingRequiredChecks(required, checkRuns, statuses);
+  if (missing.length) return { ready: false, head_sha: headSha, required, missing };
+  return { ready: true, head_sha: headSha, required };
+}
+
+// ci <issue> — 幂等 CI 门禁（design §5-7）。canEnterReview 全绿写入 ciHeadSha
+// 并转 in-review + need:reviewer；否则 need:author + 失败明细（含 SHA）。
+function ci(config, number) {
+  const item = issue(config, number);
+  const alias = repoAliasOf(item, config);
+  const repo = repoDescriptor(config, alias);
+  const state = loadState(config, alias, number);
+  const pr = findPr(config, repo, number, item, state);
+  if (!pr) fail('未找到开放 PR');
+  if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+  const headSha = pr.headRefOid;
+  const result = canEnterReview(config, repo, repo.base, headSha);
+  if (result.ready) {
+    saveState(config, alias, number, { ciHeadSha: headSha, ciVerifiedAt: new Date().toISOString() });
+    setStatus(config, number, 'in-review');
+    setNeed(config, number, 'reviewer');
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。${auditFooter(config, 'ci')}`]);
+    console.log(`#${number} -> in-review（CI 全绿，ciHeadSha=${headSha.slice(0, 8)}）`);
+  } else {
+    setNeed(config, number, 'author');
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}${auditFooter(config, 'ci')}`]);
+    console.log(`#${number} -> need:author（CI 未全绿）`);
+  }
+}
+
+// merge <issue> --verdict merge|rework — Repo Owner 唯一 merge 门（§5-9/§5-18）。
+function merge(config, number, flags) {
+  const verdict = flags.verdict;
+  if (!['merge', 'rework'].includes(verdict)) fail('--verdict 必须是 merge|rework。');
+  assertNoRoleOverride(flags);
+
+  // 1. 角色门：PL_ROLE=owner + PL_ENFORCE_APP=1（§5-18）
+  const identity = verifyLauncherIdentity(process.env);
+  if (identity.role !== 'owner') fail('merge 仅限 Repo Owner（PL_ROLE=owner）');
+
+  // 2. 读 issue + state
+  const item = issue(config, number);
+  const alias = repoAliasOf(item, config);
+  const repo = repoDescriptor(config, alias);
+  const state = loadState(config, alias, number);
+
+  // 3. PR + head
+  const pr = findPr(config, repo, number, item, state);
+  if (!pr) fail('未找到开放 PR');
+  if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+  const headSha = pr.headRefOid;
+
+  // 4. 四门重检（HEAD==reviewed sha / Required Checks@head 全绿 / LGTM 有效 / gateAudit 0 命中）
+  const failures = [];
+  const lgtm = validReviewerLgtm(state, headSha);
+  if (!lgtm) failures.push(`无有效 reviewer LGTM（需 launcher_role=reviewer 且 reviewed_head_sha=${headSha.slice(0, 8)}）`);
+  const blocks = outstandingBlocks(state, headSha);
+  if (blocks.length) failures.push(`存在未解决的 reviewer 阻塞裁决（${blocks.map((b) => `${b.principal}:${b.verdict}`).join('、')}）—— 需 author 处理后由该 reviewer 重新 review 至 LGTM`);
+  const checks = canEnterReview(config, repo, repo.base, headSha);
+  if (!checks.ready) failures.push(`Required Checks @head 未全绿：${checks.missing.join('; ')}`);
+  const violations = gateAudit(config, repo, pr.number);
+  if (violations.length) failures.push(`Owner Gate 命中：${violations.join('; ')}`);
+
+  if (verdict === 'merge') {
+    if (failures.length) fail(`merge 四门重检失败：\n- ${failures.join('\n- ')}`);
+    // Owner 裁定：控制仓 merge 走 CLI（pl-owner-control-write 需 Contents:Write /
+    // Pull requests:Write）。权限未生效时 GitHub 拒绝写入，此处 fail-closed，
+    // 不提供任何替代身份/人工合并旁路。
+    const mergeCall = repoAccess(config, repo)(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge'],
+      { allowFailure: true });
+    if (mergeCall.status !== 0) {
+      const hint = repo.isControlRepo
+        ? '控制仓 CLI merge 未获授权（fail-closed）：需 Owner 为 pl-owner-control-write 授予 '
+          + 'Contents:Write / Pull requests:Write 并留 permission readback（见 Issue #101 B2/B4）。'
+        : 'PR merge 失败（fail-closed）。';
+      fail(`${hint}\n${(mergeCall.stderr || mergeCall.stdout || `exit ${mergeCall.status}`).trim()}`);
+    }
+    const merged = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(pr.number), '-R', repo.github,
+      '--json', 'mergeCommit,state']).stdout);
+    const mergedSha = merged.mergeCommit?.oid ?? null;
+    saveState(config, alias, number, {
+      mergedSha, mergedAt: new Date().toISOString(),
+      mergeVerdict: 'merge', mergeLgtm: lgtm.review_id,
+    });
+    setStatus(config, number, 'verifying');
+    setNeed(config, number, 'issue-owner');
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}${auditFooter(config, 'merge')}`]);
+    console.log(`#${number} merged -> verifying`);
+  } else {
+    const reason = failures.length ? failures.join('；') : (flags.reason || 'Repo Owner 退回');
+    saveState(config, alias, number, { mergeVerdict: 'rework', reworkAt: new Date().toISOString(), reworkReason: reason });
+    setStatus(config, number, 'in-progress');
+    setNeed(config, number, 'author');
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+      '--body', `Repo Owner 退回（rework）：\n\n${reason}${auditFooter(config, 'merge')}`]);
+    console.log(`#${number} -> in-progress（rework）`);
   }
 }
 
@@ -282,10 +640,12 @@ function verify(config, number, flags) {
   if (!fs.existsSync(evidencePath)) fail(`验证证据文件不存在：${evidencePath}`);
   const item = issue(config, number);
   if (!labelsOf(item).includes('review:lgtm')) fail(`#${number} 尚无独立 review:lgtm。`);
+  assertSingleAssignee(item);   // 决策④
+  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const evidence = fs.readFileSync(evidencePath, 'utf8');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}`]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}${auditFooter(config, 'verify')}`]);
   setStatus(config, number, 'verified');
-  setNeed(config, number, 'owner');
+  setNeed(config, number, 'issue-owner');
   console.log(`#${number} -> verified`);
 }
 
@@ -295,10 +655,12 @@ function closeIssue(config, number, flags) {
   if (!fs.existsSync(summaryPath)) fail(`总结文件不存在：${summaryPath}`);
   const item = issue(config, number);
   if (!labelsOf(item).includes('status:verified')) fail(`#${number} 尚未完成 verified Gate。`);
+  assertSingleAssignee(item);   // 决策④
+  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
   const summary = fs.readFileSync(summaryPath, 'utf8');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}`]);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}${auditFooter(config, 'close')}`]);
   setNeed(config, number, null);
-  run('gh', ['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
+  controlGh(['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
   console.log(`#${number} closed`);
 }
 
@@ -312,8 +674,6 @@ const GATE_FILES = new Set(['AGENTS.md', 'pyproject.toml', 'src/provenlattice/st
 const GATE_DIFF_MARKERS = ['CREATE TABLE', 'ALTER TABLE', 'QUALIFIED'];
 const WORKFLOW_ALLOWED = new Set(['.github/workflows/ci.yml']);
 const WORKFLOW_FORBIDDEN_ADDED = ['permissions:', 'secrets', /^on:/];
-const HOLD_REVIEW_CHANGES = 2;
-const HOLD_CI_FAILURES = 2;
 const PILOT_ISSUES = new Set([8, 9, 10, 11, 12]);
 
 function requireSolo() {
@@ -332,14 +692,15 @@ function typeOf(item) {
 
 function hold(config, number, reason) {
   setStatus(config, number, 'hold');
-  setNeed(config, number, 'owner');
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository,
-    '--body', `Solo Mode HOLD：${reason}\n\n等待 Owner 决策（自动路径已停止）。`]);
+  setNeed(config, number, 'issue-owner');
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
+    '--body', `Solo Mode HOLD：${reason}\n\n等待 Owner 决策（自动路径已停止）。${auditFooter(config, 'hold')}`]);
   console.log(`#${number} -> hold (${reason})`);
 }
 
-function comment(config, number, body) {
-  run('gh', ['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
+function comment(config, number, body, operation) {
+  const full = operation ? `${body}${auditFooter(config, operation)}` : body;
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', full]);
 }
 
 function titleTokens(title) {
@@ -354,7 +715,7 @@ function autoApprove(config, item) {
   const missing = missingAutoElements(item.body);
   if (missing.length) return `正文缺少提案要素：${missing.join('、')}`;
   const tokens = titleTokens(item.title);
-  const open = JSON.parse(run('gh', ['issue', 'list', '-R', config.issueRepository,
+  const open = JSON.parse(controlGh(['issue', 'list', '-R', config.issueRepository,
     '--state', 'open', '--limit', '100', '--json', 'number,title']).stdout);
   const duplicate = open.filter((other) => other.number !== number).some((other) => {
     const shared = [...tokens].filter((token) => titleTokens(other.title).has(token));
@@ -369,48 +730,23 @@ function autoApprove(config, item) {
     '- 提案五要素完整：观察证据 / 期望行为 / 反例或失败条件 / 允许修改范围 / 验收方式',
     `- 查重无命中（标题词元重叠 <60%，开放 Issue ${open.length - 1} 个比对）`,
     `- 依据 policies/codegraph.md 自动推进范围；phase=${soloMode().phase}`,
-  ].join('\n'));
+  ].join('\n'), 'approve');
   console.log(`#${number} -> approved (solo auto)`);
   return null;
 }
 
-function findPr(config, repo, branch) {
-  const out = run('gh', ['pr', 'list', '-R', repo.github, '--head', branch,
-    '--state', 'all', '--json', 'number,url,headRefOid,state'], { allowFailure: true });
-  const prs = JSON.parse(out.stdout || '[]');
-  return prs.find((pr) => pr.state === 'OPEN') ?? prs[0] ?? null;
-}
-
-function checksGreen(config, repo, prNumber) {
-  const out = run('gh', ['pr', 'checks', String(prNumber), '-R', repo.github],
-    { allowFailure: true });
-  const rows = (out.stdout || '').split(/\r?\n/).filter((line) => line.includes('\t'));
-  if (!rows.length) return { green: false, failed: true, detail: 'no checks reported' };
-  const detail = [];
-  let green = true;
-  let failed = false;
-  for (const row of rows) {
-    const [, status] = row.split('\t');
-    const state = (status ?? '').trim();
-    if (state !== 'pass' && state !== 'skipping') {
-      green = false;
-      if (state === 'fail') failed = true;
-    }
-    detail.push(`${state}: ${row.split('\t')[0]}`);
-  }
-  return { green, failed, detail: detail.join('; ') };
-}
-
 function gateAudit(config, repo, prNumber) {
-  const files = JSON.parse(run('gh', ['pr', 'view', String(prNumber), '-R', repo.github,
+  const gh = repoAccess(config, repo);
+  const files = JSON.parse(gh(['pr', 'view', String(prNumber), '-R', repo.github,
     '--json', 'files']).stdout).files;
   const violations = [];
-  const diff = run('gh', ['pr', 'diff', String(prNumber), '-R', repo.github],
+  const diff = gh(['pr', 'diff', String(prNumber), '-R', repo.github],
     { allowFailure: true }).stdout;
   const added = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of files) {
     const p = file.path;
-    if (GATE_FILES.has(p) || GATE_PREFIXES.some((prefix) => p.startsWith(prefix) && !WORKFLOW_ALLOWED.has(p))) {
+    if (!isApprovedReleaseGateFile(repo.github, prNumber, p)
+      && (GATE_FILES.has(p) || GATE_PREFIXES.some((prefix) => p.startsWith(prefix) && !WORKFLOW_ALLOWED.has(p)))) {
       if (!WORKFLOW_ALLOWED.has(p)) violations.push(`gate 文件：${p}`);
     }
     if (p.startsWith('.github/workflows/') && !WORKFLOW_ALLOWED.has(p)) {
@@ -430,77 +766,46 @@ function gateAudit(config, repo, prNumber) {
   return [...new Set(violations)];
 }
 
-function reviewLgtmSha(config, item) {
-  const comments = JSON.parse(run('gh', ['issue', 'view', String(item.number),
-    '-R', config.issueRepository, '--json', 'comments']).stdout).comments;
-  for (let i = comments.length - 1; i >= 0; i -= 1) {
-    const match = comments[i].body.match(/独立 review：LGTM，审查 commit `([0-9a-f]{7,40})`/);
-    if (match) return { sha: match[1], url: comments[i].url };
-  }
-  return null;
-}
-
 function autoMerge(config, item, alias, repo, state) {
   const number = item.number;
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const pr = findPr(config, repo, branch);
+  const pr = findPr(config, repo, number, item, state);
   if (!pr) return '未找到开放 PR';
   if (pr.state !== 'OPEN') return `PR #${pr.number} 状态 ${pr.state}`;
-  const head = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
-    '--json', 'headRefOid']).stdout).headRefOid;
+  const head = pr.headRefOid;
   if (state.head && state.head !== head) {
     return `state HEAD ${state.head.slice(0, 8)} != PR head ${head.slice(0, 8)}（新 commit 需重审）`;
   }
-  const review = reviewLgtmSha(config, item);
-  if (!review) return '尚无 LGTM review';
-  if (review.sha !== head.slice(0, review.sha.length)) {
-    return `LGTM SHA ${review.sha} != PR head ${head.slice(0, 8)}（新 commit 使复审失效）`;
-  }
-  if ((state.reviewChangesCount ?? 0) >= HOLD_REVIEW_CHANGES) {
-    hold(config, number, `复审 changes 达 ${state.reviewChangesCount} 轮`);
-    return 'held';
-  }
-  const checks = checksGreen(config, repo, pr.number);
-  if (!checks.green) {
-    const next = saveState(config, alias, number, {
-      ciFailCount: checks.failed ? (state.ciFailCount ?? 0) + 1 : (state.ciFailCount ?? 0),
-    });
-    if (checks.failed && next.ciFailCount >= HOLD_CI_FAILURES) {
-      hold(config, number, `CI 失败达 ${next.ciFailCount} 次`);
-      return 'held';
-    }
-    return `CI 未全绿：${checks.detail}`;
-  }
+  const lgtm = validReviewerLgtm(state, head);
+  if (!lgtm) return '尚无有效 reviewer LGTM（SHA 绑定）';
+  const blocks = outstandingBlocks(state, head);
+  if (blocks.length) return `存在未解决的 reviewer 阻塞裁决（${blocks.map((b) => `${b.principal}:${b.verdict}`).join('、')}）—— 需 author 处理后由该 reviewer 重新 review 至 LGTM`;
+  const checks = canEnterReview(config, repo, repo.base, head);
+  if (!checks.ready) return `CI 未全绿：${checks.missing.join('; ')}`;
   const violations = gateAudit(config, repo, pr.number);
   if (violations.length) {
     hold(config, number, `Owner Gate 命中：\n- ${violations.join('\n- ')}`);
     return 'held';
   }
-  run('gh', ['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
-  const merged = JSON.parse(run('gh', ['pr', 'view', String(pr.number), '-R', repo.github,
-    '--json', 'mergeCommit,state']).stdout);
-  saveState(config, alias, number, {
-    mergedSha: merged.mergeCommit?.oid ?? null, prUrl: pr.url,
-    head, gates: 'HEAD绑定/LGTM匹配/CI全绿/gate审计通过',
-  });
-  setStatus(config, number, 'verifying');
-  setNeed(config, number, 'author');
+  // 决策⑤（§5-13）：Solo Mode 到 merge 门即停，不自动 merge，置 need:repo-owner。
+  saveState(config, alias, number, { soloMergeGateReady: true, head });
+  setNeed(config, number, 'repo-owner');
   comment(config, number, [
-    `Solo Mode 自动合并：PR #${pr.number}`,
-    `- HEAD：\`${head.slice(0, 12)}\`；merge：\`${(merged.mergeCommit?.oid ?? '').slice(0, 12)}\``,
-    `- LGTM：${review.url}`,
-    `- 质量门：HEAD 绑定 ✓ / LGTM 匹配 ✓ / CI 全绿 ✓ / Owner Gate 审计 0 命中 ✓`,
-  ].join('\n'));
-  console.log(`#${number} merged (solo auto) -> verifying`);
+    `Solo Mode 到达 merge 门（决策⑤：不自动 merge）。`,
+    `- HEAD：\`${head.slice(0, 12)}\``,
+    `- LGTM（reviewer）：${lgtm.review_id}`,
+    `- CI 全绿 ✓ / gate 审计 0 命中 ✓`,
+    `- 待 Repo Owner 执行 \`npm run pilot -- merge ${number} --verdict merge\`。`,
+  ].join('\n'), 'merge-gate');
+  console.log(`#${number} -> need:repo-owner（solo 停 merge 门）`);
   return null;
 }
 
 function autoVerify(config, item, alias, repo, state) {
   const number = item.number;
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const found = findPr(config, repo, branch);
+  // 合并后的 PR 不再是 OPEN；绑定身份校验仍然生效。
+  const found = findPr(config, repo, number, item, state, { requireOpen: false });
   if (!found) return '未找到 PR';
-  const view = JSON.parse(run('gh', ['pr', 'view', String(found.number), '-R', repo.github,
+  const view = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(found.number), '-R', repo.github,
     '--json', 'state,mergeCommit,url']).stdout);
   if (view.state !== 'MERGED') return `PR #${found.number} 尚未合并`;
   const mergedSha = view.mergeCommit?.oid ?? state.mergedSha;
@@ -549,7 +854,7 @@ function advanceOnce(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') return { progress: false, reason: 'closed' };
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const status = statusOf(item);
   const state = loadState(config, alias, number);
   switch (status) {
@@ -579,8 +884,8 @@ function advanceOnce(config, number) {
         return { progress: false, reason: '无 commit（实现中）' };
       }
       submit(config, number);
-      const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-      const pr = findPr(config, repo, branch);
+      // submit 写入绑定后必须重读 state，否则本次 findPr 仍用旧 state。
+      const pr = findPr(config, repo, number, item, loadState(config, alias, number));
       saveState(config, alias, number, {
         prUrl: pr?.url, head: pr?.headRefOid,
         submittedAt: new Date().toISOString(),
@@ -589,7 +894,7 @@ function advanceOnce(config, number) {
     }
     case 'in-review': {
       const result = autoMerge(config, item, alias, repo, state);
-      return { progress: result === null, reason: result ?? 'merged' };
+      return { progress: result === null, reason: result ?? 'merge-gate（待 repo-owner）' };
     }
     case 'verifying': {
       const result = autoVerify(config, item, alias, repo, state);
@@ -644,7 +949,10 @@ try {
     else if (command === 'approve') approve(config, requireNumber(positionals[0]));
     else if (command === 'run') startRun(config, requireNumber(positionals[0]));
     else if (command === 'submit') submit(config, requireNumber(positionals[0]));
+    else if (command === 'bind') bind(config, requireNumber(positionals[0]), flags);
+    else if (command === 'ci') ci(config, requireNumber(positionals[0]));
     else if (command === 'review') review(config, requireNumber(positionals[0]), flags);
+    else if (command === 'merge') merge(config, requireNumber(positionals[0]), flags);
     else if (command === 'verify') verify(config, requireNumber(positionals[0]), flags);
     else if (command === 'close') closeIssue(config, requireNumber(positionals[0]), flags);
     else if (command === 'advance') advance(config, requireNumber(positionals[0]));

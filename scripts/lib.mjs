@@ -81,7 +81,10 @@ function ghTokenEnvironment(baseEnv) {
 
 export function run(command, args = [], options = {}) {
   let environment = { ...process.env, ...(options.env ?? {}) };
-  if (command === 'gh') environment = ghTokenEnvironment(environment);
+  // tokenContext 'control' binds the control/write App token: no primary-token
+  // renewal and no primary-token fallback on 401 (fail-closed instead).
+  const control = options.tokenContext === 'control';
+  if (command === 'gh' && !control) environment = ghTokenEnvironment(environment);
   const result = spawnSync(command, args, {
     cwd: options.cwd ?? root,
     encoding: 'utf8',
@@ -94,7 +97,7 @@ export function run(command, args = [], options = {}) {
   if (result.status !== 0) {
     const output = `${result.stderr || ''}\n${result.stdout || ''}`;
     const rejected = /\b401\b|Bad credentials/i.test(output);
-    if (command === 'gh' && process.env.PL_ENFORCE_APP === '1' && !options.noRetry401 && rejected) {
+    if (command === 'gh' && process.env.PL_ENFORCE_APP === '1' && !options.noRetry401 && rejected && !control) {
       const minted = mintAppToken(environment);
       if (minted.ok) {
         adoptMintedToken(minted);
@@ -165,17 +168,180 @@ export function labelsOf(issue) {
   return (issue.labels ?? []).map((label) => typeof label === 'string' ? label : label.name);
 }
 
+// Owner-authorized exception for issue-pilot#101 / PR #103 only.
+const GOVERNANCE_V2_RELEASE_DOCS = new Set([
+  'policies/governance-v2/acceptance-matrix.md',
+  'policies/governance-v2/consistency-report.md',
+  'policies/governance-v2/design.md',
+  'policies/governance-v2/reviewer-bot-design.md',
+  'policies/governance-v2/revision-notes.md',
+  'policies/governance-v2/sha256-list.md',
+]);
+
+export function isApprovedReleaseGateFile(repository, prNumber, filePath) {
+  return repository === 'sunSUNQ/issue-pilot'
+    && prNumber === 103
+    && GOVERNANCE_V2_RELEASE_DOCS.has(filePath);
+}
+
 export function repoAliasOf(issue, config) {
   const labels = labelsOf(issue);
   const label = labels.find((item) => item.startsWith('repo:'));
   if (!label) fail(`Issue #${issue.number} 缺少 repo:<alias> label。`);
   const alias = label.slice(5);
-  if (!config.repositories[alias]) fail(`repos.local.json 未注册仓库 ${alias}。`);
+  if (!config.repositories[alias] && alias !== controlRepoAlias(config)) {
+    fail(`repos.local.json 未注册仓库 ${alias}。`);
+  }
   return alias;
 }
 
+// ---------------------------------------------------------------------------
+// R3 — control-repo self-route（governance-v2 控制仓发布 PR 路由）
+// ---------------------------------------------------------------------------
+
+// The control repo (config.issueRepository) is addressable as a target repo via
+// the `repo:<alias>` label when <alias> equals the issueRepository's short repo
+// name (e.g. `repo:issue-pilot` for `sunSUNQ/issue-pilot`). This is the only
+// alias that resolves WITHOUT an entry in config.repositories.
+export function controlRepoAlias(config) {
+  return (config.issueRepository ?? '').split('/').pop() ?? '';
+}
+
+// Resolve a repo alias to a descriptor. Product repos come from
+// config.repositories (registered aliases win, unchanged). The control repo is
+// synthesized (isControlRepo=true) when the alias matches controlRepoAlias.
+// Unknown aliases still fail closed.
+export function repoDescriptor(config, alias) {
+  const product = config.repositories[alias];
+  if (product) {
+    return {
+      alias,
+      isControlRepo: false,
+      github: product.github,
+      base: product.base ?? 'main',
+      policy: product.policy ?? alias,
+      checks: product.checks ?? [],
+      path: product.path,
+    };
+  }
+  if (alias && alias === controlRepoAlias(config)) {
+    return {
+      alias,
+      isControlRepo: true,
+      github: config.issueRepository,
+      base: 'main',
+      policy: 'governance-v2',
+      checks: [],
+      path: root,
+    };
+  }
+  fail(`repos.local.json 未注册仓库 ${alias}。`);
+}
+
+// R3 — PR identity / uniqueness validation (pure, testable). `expected` pins the
+// fields the caller resolved the PR by (repository / number / base / head branch /
+// HEAD SHA — each optional). Returns an array of human-readable violations; an
+// empty array means the PR matches every pinned field.
+export function prIdentityViolations(pr, expected = {}) {
+  const violations = [];
+  if (expected.repository && pr.repository !== expected.repository) {
+    violations.push(`PR #${pr.number} 不属于仓库 ${expected.repository}（实际 ${pr.repository}）`);
+  }
+  if (expected.number != null && expected.number !== pr.number) {
+    violations.push(`PR #${pr.number} != 期望 PR #${expected.number}`);
+  }
+  if (expected.base && pr.baseRefName !== expected.base) {
+    violations.push(`PR #${pr.number} base ${pr.baseRefName} != 期望 ${expected.base}`);
+  }
+  if (expected.head && pr.headRefName !== expected.head) {
+    violations.push(`PR #${pr.number} head branch ${pr.headRefName} != 期望 ${expected.head}`);
+  }
+  if (expected.sha && pr.headRefOid !== expected.sha) {
+    violations.push(`PR #${pr.number} HEAD ${pr.headRefOid} != 期望 ${expected.sha}`);
+  }
+  return violations;
+}
+
+// R3 — per-repo GitHub accessor. Control-repo (config.issueRepository)
+// operations bind the control/write App token; product repos keep the primary
+// product token (unchanged).
+export function repoAccess(config, repo) {
+  return repo.isControlRepo ? controlGh : productGh;
+}
+
+export const PR_JSON_FIELDS = 'number,url,headRefOid,headRefName,baseRefName,state';
+
+// Parse `owner/repo` from a GitHub PR URL. Used to validate the API-returned PR
+// against the pinned repository instead of trusting a caller-assigned field.
+export function prRepositoryFromUrl(url) {
+  const match = /^https?:\/\/[^/]+\/([^/]+\/[^/]+)\/pull\/\d+(?:\/)?(?:[?#].*)?$/.exec(url ?? '');
+  return match?.[1] ?? null;
+}
+
+// R3 — binding record persisted by `bind` (and by `submit` for product PRs).
+// Every identity field comes from the API response, never from flags, so
+// `findPr` can pin repository / number / base / head branch / HEAD SHA.
+export function bindingRecord(pr, identity = {}, now = new Date().toISOString()) {
+  return {
+    prNumber: pr.number,
+    prUrl: pr.url,
+    prBranch: pr.headRefName,
+    prBase: pr.baseRefName,
+    prHeadSha: pr.headRefOid,
+    boundAt: now,
+    boundBy: identity.principal ?? null,
+    boundWriter: identity.writeTokenBot ?? identity.tokenBot ?? null,
+  };
+}
+
+// R3 — resolve the PR for an issue + repo. Two modes:
+//   1. Explicit binding (state.prNumber): used by control-repo release PRs and
+//      by product PRs after `submit`. Fetches the pinned PR and fails closed on
+//      any repository / number / base / head branch / HEAD SHA mismatch.
+//      requireOpen defaults to true for the control repo (release PRs are only
+//      actionable while OPEN); merged-PR consumers (autoVerify) pass false.
+//   2. Branch inference (product repos without a binding): unchanged legacy
+//      behavior keyed on issue-pilot/<n>-<slug>; multiple open PRs fail closed.
+// `opts.gh` injects a fake gh runner for tests.
+export function findPr(config, repo, number, item, state, opts = {}) {
+  const gh = opts.gh ?? repoAccess(config, repo);
+
+  if (state?.prNumber != null) {
+    const pr = JSON.parse(gh(['pr', 'view', String(state.prNumber), '-R', repo.github,
+      '--json', PR_JSON_FIELDS]).stdout);
+    const repository = prRepositoryFromUrl(pr.url);
+    const violations = prIdentityViolations({ ...pr, repository }, {
+      repository: repo.github,
+      number: state.prNumber,
+      base: state.prBase ?? repo.base,
+      head: state.prBranch ?? null,
+      sha: state.prHeadSha ?? null,
+    });
+    if (violations.length) fail(`PR 身份校验失败（fail-closed）：\n- ${violations.join('\n- ')}`);
+    const requireOpen = opts.requireOpen ?? repo.isControlRepo;
+    if (requireOpen && pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+    return { ...pr, repository: repo.github };
+  }
+
+  if (repo.isControlRepo) {
+    fail(`控制仓 ${repo.github} 的 Issue #${number} 未绑定 PR（fail-closed）。\n`
+      + '请先执行显式绑定（PR 号见发布 PR）：\n'
+      + `  npm run pilot -- bind ${number} --pr <PR_NUMBER> --branch <HEAD_BRANCH> --base ${repo.base} --sha <HEAD_SHA>`);
+  }
+
+  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
+  const out = gh(['pr', 'list', '-R', repo.github, '--head', branch,
+    '--state', 'all', '--json', PR_JSON_FIELDS], { allowFailure: true });
+  const prs = JSON.parse(out.stdout || '[]');
+  const open = prs.filter((pr) => pr.state === 'OPEN');
+  if (open.length > 1) fail(`PR 歧义：分支 \`${branch}\` 有 ${open.length} 个开放 PR（需显式绑定 prNumber）`);
+  const pr = open[0] ?? prs[0] ?? null;
+  if (pr) pr.repository = repo.github;
+  return pr;
+}
+
 export function issue(config, number) {
-  const text = run('gh', [
+  const text = controlGh([
     'issue', 'view', String(number), '-R', config.issueRepository,
     '--json', 'number,title,body,labels,assignees,url,state',
   ]).stdout;
@@ -186,20 +352,366 @@ export function setStatus(config, number, status) {
   const current = issue(config, number);
   const statuses = labelsOf(current).filter((label) => label.startsWith('status:'));
   for (const label of statuses) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
   }
-  run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`]);
+  controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `status:${status}`]);
 }
 
 export function setNeed(config, number, need) {
   const current = issue(config, number);
   const needs = labelsOf(current).filter((label) => label.startsWith('need:'));
   for (const label of needs) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--remove-label', label]);
   }
   if (need) {
-    run('gh', ['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`]);
+    controlGh(['issue', 'edit', String(number), '-R', config.issueRepository, '--add-label', `need:${need}`]);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Governance V2 identity / assignee / dual-token helpers
+// (frozen: policies/governance-v2/reviewer-bot-design.md §3–§4)
+// ---------------------------------------------------------------------------
+
+// Per-role hard-pinned governance principal (R7 role-specific check).
+const ROLE_PRINCIPALS = {
+  reviewer: 'pl-issue-reviewer[bot]',
+  owner: 'sunSUNQ',
+  worker: 'pl-issue-worker[bot]',
+};
+
+// Per-role control/write App bot — the actual GitHub actor for control-repo
+// (config.issueRepository) writes. Distinct from the product App bot; see
+// policies/governance-v2/reviewer-bot-design.md §3 and the Plan-A six-App model.
+const ROLE_WRITE_BOTS = {
+  reviewer: 'pl-issue-reviewer-write[bot]',
+  owner: 'pl-owner-control-write[bot]',
+  worker: 'pl-worker-control-write[bot]',
+};
+
+// Per-role product/READ App bot — the actual GitHub actor for product-repo
+// (config.repositories[*]) reads/writes. Distinct from ROLE_WRITE_BOTS (control
+// repo) and from ROLE_PRINCIPALS (the governance principal). Hard-pinned in the
+// role launchers (start-{worker,reviewer,owner}-agent.ps1).
+const ROLE_READ_BOTS = {
+  reviewer: 'pl-issue-reviewer-read[bot]',
+  owner: 'pl-owner-reviewer[bot]',
+  worker: 'pl-issue-worker[bot]',
+};
+
+// GitHub principal namespace: a human login or a bot login (`<name>[bot]`).
+// Rejects free-form strings so PL_PRINCIPAL is only ever compared against
+// assignees in the same namespace (reviewer-bot-design.md §3 "命名空间").
+const GITHUB_PRINCIPAL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$/;
+
+export function isGitHubPrincipal(value) {
+  return typeof value === 'string' && GITHUB_PRINCIPAL_RE.test(value);
+}
+
+// Issue Owner semantics (Plan A fix): the assignee is the Issue Owner — the
+// human responsible for the issue lifecycle — NOT the bot that happens to run
+// the command. `propose` must receive an explicit, human GitHub login; never
+// default to `@me` / the control-write App bot. Fail-closed otherwise.
+export function requireIssueOwner(assignee) {
+  if (!assignee || !isGitHubPrincipal(assignee) || /\[bot\]$/.test(assignee)) {
+    fail('propose 必须显式 --assignee <owner-login>（Issue Owner 须为人类登录名，fail-closed；禁止 bot）');
+  }
+  return assignee;
+}
+
+// Query the real login a GitHub token acts as, trusting only GitHub's answer —
+// never any caller-set PL_* env var. Uses `gh api graphql` (no credential read
+// from disk; the token is passed in-memory via env). Any anomaly fails closed.
+function resolveTokenLoginDefault(token, kind, env) {
+  const result = run('gh', ['api', 'graphql', '-f', 'query=query{viewer{login}}'], {
+    env: { ...env, GH_TOKEN: token, GITHUB_TOKEN: token },
+    tokenContext: 'control',
+    noRetry401: true,
+    allowFailure: true,
+  });
+  if (result.status !== 0) {
+    fail(`身份校验失败：${kind} token 真实身份查询失败（fail-closed）：${(result.stderr || `exit ${result.status}`).trim()}`);
+  }
+  let login = '';
+  try { login = JSON.parse(result.stdout)?.data?.viewer?.login ?? ''; } catch { login = ''; }
+  if (!login) fail(`身份校验失败：${kind} token 无法解析真实登录名（fail-closed）`);
+  return login;
+}
+
+// verifyLauncherIdentity — generic + role-specific launcher identity checks.
+// Fail-closed on any anomaly (R7 constraints 1–6 / §4 通用校验 + 角色专属校验).
+//
+// P1-1: the ACTUAL token identity is resolved from GitHub and bound to the role
+// via hard-pinned ROLE_READ_BOTS / ROLE_WRITE_BOTS. Caller-set PL_TOKEN_BOT /
+// PL_EXPECTED_BOT / PL_WRITE_TOKEN_BOT / PL_WRITE_EXPECTED_BOT are NOT trusted
+// as evidence of identity. Any mismatch fails closed.
+// Returns the normalized identity (role / principal / githubLogin / tokenBot).
+export function verifyLauncherIdentity(env = process.env, opts = {}) {
+  if (env.PL_ENFORCE_APP !== '1') {
+    fail('身份校验失败：PL_ENFORCE_APP != 1（非 Launcher 会话，fail-closed）');
+  }
+  const role = env.PL_ROLE;
+  if (!['worker', 'reviewer', 'owner'].includes(role)) {
+    fail(`身份校验失败：PL_ROLE 缺失或非法（${role ?? '(unset)'}）`);
+  }
+  const principal = env.PL_PRINCIPAL;
+  const expectedPrincipal = ROLE_PRINCIPALS[role];
+  if (opts.requirePrincipal !== false) {
+    if (!principal) fail(`身份校验失败：PL_PRINCIPAL 缺失（role=${role}）`);
+    if (!isGitHubPrincipal(principal)) fail(`身份校验失败：PL_PRINCIPAL 非法主体形态（${principal}）`);
+    if (principal !== expectedPrincipal) {
+      fail(`身份校验失败：PL_PRINCIPAL 与 role 不符（${principal}，期望 ${expectedPrincipal}）`);
+    }
+  }
+
+  const resolve = opts.resolveTokenLogin ?? resolveTokenLoginDefault;
+
+  // 主（product/read）token 的真实身份必须等于该角色钉扎的 READ bot。
+  const primaryToken = env.PL_GIT_TOKEN || env.GH_TOKEN || null;
+  if (!primaryToken) fail('身份校验失败：主 token 缺失（fail-closed）');
+  const primaryExpected = ROLE_READ_BOTS[role];
+  const primaryLogin = resolve(primaryToken, 'read', env);
+  if (!primaryLogin) fail('身份校验失败：主 token 无法解析真实身份（fail-closed）');
+  if (primaryLogin !== primaryExpected) {
+    fail(`身份校验失败：主 token 真实身份 ${primaryLogin} 与 role=${role} 不符（期望 ${primaryExpected}，fail-closed）`);
+  }
+
+  // 写（control）token 的真实身份必须等于该角色钉扎的 WRITE bot（双 App 模型）。
+  let writeLogin = null;
+  if (env.PL_WRITE_GIT_TOKEN) {
+    const writeExpected = ROLE_WRITE_BOTS[role];
+    writeLogin = resolve(env.PL_WRITE_GIT_TOKEN, 'write', env);
+    if (!writeLogin) fail('身份校验失败：写侧 token 无法解析真实身份（fail-closed）');
+    if (writeLogin !== writeExpected) {
+      fail(`身份校验失败：写侧 token 真实身份 ${writeLogin} 与 role=${role} 不符（期望 ${writeExpected}，fail-closed）`);
+    }
+  }
+
+  return {
+    role,
+    principal,
+    githubLogin: env.PL_GITHUB_LOGIN || primaryLogin,
+    tokenBot: primaryLogin,
+    // 实际执行 GitHub 写操作的身份（reviewer 双 App 为写侧 bot；单 App 为 null）
+    writeTokenBot: writeLogin,
+  };
+}
+
+// G11 — control-repo write audit. Every control-repo (config.issueRepository)
+// write must expose the traceable chain role -> principal -> writer_login ->
+// repository -> operation (not just review). Calls verifyLauncherIdentity, so
+// any control-repo write outside a valid launcher session fails closed.
+export function writeAudit(config, operation, env = process.env, opts = {}) {
+  const identity = verifyLauncherIdentity(env, opts);
+  return {
+    role: identity.role,
+    principal: identity.principal,
+    writer_login: identity.writeTokenBot ?? identity.tokenBot,
+    repository: config.issueRepository,
+    operation,
+  };
+}
+
+// Markdown footer appended to every control-repo operation comment (audit trail).
+export function auditFooter(config, operation, env = process.env, opts = {}) {
+  const a = writeAudit(config, operation, env, opts);
+  return [
+    '',
+    '---',
+    '<sub>control-plane audit</sub>',
+    `role=\`${a.role}\` principal=\`${a.principal}\` writer_login=\`${a.writer_login}\` repository=\`${a.repository}\` operation=\`${a.operation}\``,
+  ].join('\n');
+}
+
+// Assert the CLI was not handed an external --role/--principal override.
+// Launcher identity is hard-pinned; any attempted override must fail closed.
+export function assertNoRoleOverride(flags) {
+  if (flags.role !== undefined || flags.principal !== undefined) {
+    fail('拒绝 --role/--principal 覆盖（Launcher 身份硬钉，fail-closed）');
+  }
+}
+
+export function assigneesOf(issue) {
+  return (issue.assignees ?? []).map((a) => (typeof a === 'string' ? a : a.login));
+}
+
+// decision ④: the sole assignee is the issue-owner routing key. 0 or >1
+// assignees block owner-gated transitions (approve/verify/close/review).
+export function assertSingleAssignee(issue) {
+  const assignees = assigneesOf(issue);
+  if (assignees.length === 0) fail(`#${issue.number} 无 assignee（决策④：0 assignee 阻止转换）`);
+  if (assignees.length > 1) fail(`#${issue.number} 有 ${assignees.length} 个 assignee（决策④：>1 assignee 阻止转换）`);
+  return assignees[0];
+}
+
+// Write-side token env for control-repo comment/label writes. The reviewer
+// read App has no Issues permission, so control-repo writes must use the
+// write App token (PL_WRITE_GIT_TOKEN). Fail-closed if absent.
+export function writeTokenEnv(env = process.env) {
+  if (!env.PL_WRITE_GIT_TOKEN) fail('PL_WRITE_GIT_TOKEN 缺失（写侧 token，fail-closed）');
+  return { GH_TOKEN: env.PL_WRITE_GIT_TOKEN, PL_GIT_TOKEN: env.PL_WRITE_GIT_TOKEN };
+}
+
+// Control-repo access entry point. Binds ALL control-repo (config.issueRepository)
+// reads + writes to the control/write App token (PL_WRITE_GIT_TOKEN). Fail-closed
+// if absent — never falls back to the product token. No primary-token renewal/retry.
+export function controlGh(args, options = {}) {
+  const wEnv = writeTokenEnv({ ...process.env, ...(options.env ?? {}) });
+  return run('gh', args, { ...options, env: wEnv, tokenContext: 'control' });
+}
+
+// Product-repo access entry point. Binds ALL product-repo (config.repositories[*])
+// operations to the primary product App token (GH_TOKEN, with renewal + retry).
+export function productGh(args, options = {}) {
+  return run('gh', args, options);
+}
+
+// Required-checks extraction from a single ruleset DETAIL object (pure, testable).
+// The GitHub rulesets LIST endpoint returns only a summary (no `conditions`/`rules`),
+// so callers must fetch each ruleset's DETAIL first. Returns the required_status_checks
+// entries ({ context, integration_id|null }) when the ruleset applies to `base`;
+// otherwise [].
+export function requiredChecksFromRuleset(rs, base) {
+  if (rs.enforcement !== 'active') return [];
+  if (rs.target !== 'branch') return [];
+  const include = rs.conditions?.ref_name?.include ?? [];
+  if (!(include.includes('~DEFAULT_BRANCH') || include.includes(base))) return [];
+  const out = [];
+  for (const rule of rs.rules ?? []) {
+    if (rule.type !== 'required_status_checks') continue;
+    for (const sc of rule.parameters?.required_status_checks ?? []) {
+      out.push({ context: sc.context, integration_id: sc.integration_id ?? null });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// P1-2 / G10 pure helpers (testable without network)
+// ---------------------------------------------------------------------------
+
+// validReviewerLgtm — a reviewer LGTM is valid only if it is that reviewer's
+// LATEST verdict for the given head SHA. Any later CHANGES/BLOCKED from the same
+// reviewer on the same SHA supersedes (invalidates) an earlier LGTM. Records are
+// isolated by (role, principal, reviewed_head_sha). Replaces the old
+// "filter(lgtm).pop()" logic, which could not see a later non-LGTM verdict.
+export function validReviewerLgtm(state, headSha) {
+  const reviews = state.reviews ?? [];
+  const latest = new Map();
+  for (const r of reviews) {
+    const key = `${r.launcher_role ?? ''}\u0000${r.principal ?? ''}\u0000${r.reviewed_head_sha ?? ''}`;
+    // Reviews are appended in order: a later element is a later review -> overwrite.
+    latest.set(key, r);
+  }
+  for (const r of latest.values()) {
+    if (r.reviewer_verdict === 'lgtm' && r.launcher_role === 'reviewer' && r.reviewed_head_sha === headSha) {
+      return r;
+    }
+  }
+  return null;
+}
+
+// outstandingBlocks — reviewers whose LATEST verdict for headSha is a blocking
+// verdict (changes / blocked). Both block merge, per Owner rule:
+//   - LGTM    -> valid approval.
+//   - CHANGES -> block merge until that reviewer's subsequent LGTM.
+//   - BLOCKED -> block merge until the blocker is resolved and review completes
+//                (BLOCKED is NOT a code defect, but it is NOT an approval either).
+// A block is NOT cleared by a DIFFERENT reviewer's LGTM; only the same reviewer's
+// later LGTM on the same SHA clears it. Records isolated per (role, principal, sha).
+export function outstandingBlocks(state, headSha) {
+  const reviews = state.reviews ?? [];
+  const latest = new Map();
+  for (const r of reviews) {
+    const key = `${r.launcher_role ?? ''}\u0000${r.principal ?? ''}\u0000${r.reviewed_head_sha ?? ''}`;
+    latest.set(key, r);
+  }
+  const blockers = [];
+  for (const r of latest.values()) {
+    if (r.reviewed_head_sha !== headSha) continue;
+    if (r.reviewer_verdict === 'changes' || r.reviewer_verdict === 'blocked') {
+      blockers.push({ principal: r.principal, verdict: r.reviewer_verdict });
+    }
+  }
+  return blockers;
+}
+
+// Latest check run for a (context, integration_id) group, independent of API
+// order. Recency key is the run `id` (monotonic: a re-run gets a HIGHER id and is
+// always present), with `started_at` as tiebreak. This matters: a pending/in-
+// progress re-run has completed_at=null, so sorting by completed_at would push it
+// to the bottom and let an earlier success mask it. Sorting by id keeps the newest
+// (possibly still-running) run authoritative -> fail-closed on pending.
+function latestCheckRun(runs) {
+  return [...runs].sort((a, b) => {
+    const idA = Number(a.id) || 0;
+    const idB = Number(b.id) || 0;
+    if (idA !== idB) return idB - idA;
+    const ta = Date.parse(a.started_at ?? '') || 0;
+    const tb = Date.parse(b.started_at ?? '') || 0;
+    return tb - ta;
+  })[0];
+}
+
+// Latest commit status for a context, independent of API order (updated_at desc).
+function latestCommitStatus(statuses) {
+  return [...statuses].sort((a, b) => {
+    const ta = Date.parse(a.updated_at ?? a.created_at ?? '') || 0;
+    const tb = Date.parse(b.updated_at ?? b.created_at ?? '') || 0;
+    return tb - ta;
+  })[0];
+}
+
+// missingRequiredChecks — evaluate required checks against check runs + commit
+// statuses, fail-closed. Returns human-readable failures (empty = all satisfied).
+// Rules:
+//   - A required check is satisfied only by its LATEST run/status (re-run aware).
+//   - Only conclusion 'success' (runs) / state 'success' (statuses) satisfies.
+//   - pending / queued / in_progress / skipped / neutral / failure / missing are
+//     all fail-closed (non-satisfying).
+//   - Grouping is by (context, integration_id); same-name checks from different
+//     Apps are independent.
+export function missingRequiredChecks(required, checkRuns, statuses) {
+  const missing = [];
+  for (const { context, integration_id } of required) {
+    const runs = checkRuns.filter((c) =>
+      c.name === context && (integration_id == null || (c.app?.id ?? null) === integration_id));
+    if (runs.length > 0) {
+      const latest = latestCheckRun(runs);
+      if (latest.status !== 'completed') {
+        missing.push(`${context}: status=${latest.status}（未完成）`);
+      } else if (latest.conclusion !== 'success') {
+        missing.push(`${context}: conclusion=${latest.conclusion ?? '(null)'}（非 success，fail-closed）`);
+      }
+      continue;
+    }
+    if (integration_id == null) {
+      const matching = statuses.filter((s) => s.context === context);
+      if (matching.length > 0) {
+        const latest = latestCommitStatus(matching);
+        if (latest.state !== 'success') {
+          missing.push(`${context}: state=${latest.state ?? '(null)'}（非 success）`);
+        }
+        continue;
+      }
+    }
+    missing.push(`${context}: 缺失或不成功（integration_id=${integration_id ?? 'null'}）`);
+  }
+  return missing;
+}
+
+// decision ④ / E15：assignee 变化时记录 OwnerTransfer 事件（审计留痕）。
+// 首次记录当前 assignee 作为基线；后续变化 append 到 state.ownerTransfers。
+export function detectOwnerTransfer(config, alias, number, issue) {
+  const assignee = assigneesOf(issue)[0] ?? null;
+  const state = loadState(config, alias, number);
+  if (state.assignee && assignee && state.assignee !== assignee) {
+    const entry = { from: state.assignee, to: assignee, at: new Date().toISOString() };
+    saveState(config, alias, number, { assignee, ownerTransfers: [...(state.ownerTransfers ?? []), entry] });
+    return entry;
+  }
+  if (assignee) saveState(config, alias, number, { assignee });
+  return null;
 }
 
 export function worktreePath(config, alias, number) {
