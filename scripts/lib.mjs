@@ -168,6 +168,22 @@ export function labelsOf(issue) {
   return (issue.labels ?? []).map((label) => typeof label === 'string' ? label : label.name);
 }
 
+// Owner-authorized exception for issue-pilot#101 / PR #103 only.
+const GOVERNANCE_V2_RELEASE_DOCS = new Set([
+  'policies/governance-v2/acceptance-matrix.md',
+  'policies/governance-v2/consistency-report.md',
+  'policies/governance-v2/design.md',
+  'policies/governance-v2/reviewer-bot-design.md',
+  'policies/governance-v2/revision-notes.md',
+  'policies/governance-v2/sha256-list.md',
+]);
+
+export function isApprovedReleaseGateFile(repository, prNumber, filePath) {
+  return repository === 'sunSUNQ/issue-pilot'
+    && prNumber === 103
+    && GOVERNANCE_V2_RELEASE_DOCS.has(filePath);
+}
+
 export function repoAliasOf(issue, config) {
   const labels = labelsOf(issue);
   const label = labels.find((item) => item.startsWith('repo:'));

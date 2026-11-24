@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
-  detectOwnerTransfer, ensurePathOnD, fail, issue, labelsOf, loadConfig,
+  detectOwnerTransfer, ensurePathOnD, fail, isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
   loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
   parseArgs, productGh, repoAliasOf, requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
   saveState, setNeed, setStatus, slugify, soloMode, statePath,
@@ -666,7 +666,8 @@ function gateAudit(config, repo, prNumber) {
   const added = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of files) {
     const p = file.path;
-    if (GATE_FILES.has(p) || GATE_PREFIXES.some((prefix) => p.startsWith(prefix) && !WORKFLOW_ALLOWED.has(p))) {
+    if (!isApprovedReleaseGateFile(repo.github, prNumber, p)
+      && (GATE_FILES.has(p) || GATE_PREFIXES.some((prefix) => p.startsWith(prefix) && !WORKFLOW_ALLOWED.has(p)))) {
       if (!WORKFLOW_ALLOWED.has(p)) violations.push(`gate 文件：${p}`);
     }
     if (p.startsWith('.github/workflows/') && !WORKFLOW_ALLOWED.has(p)) {

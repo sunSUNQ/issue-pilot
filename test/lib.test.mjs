@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
-  auditFooter, labelsOf, mintAppToken, missingRequiredChecks, outstandingBlocks,
+  auditFooter, isApprovedReleaseGateFile, labelsOf, mintAppToken, missingRequiredChecks, outstandingBlocks,
   parseArgs, requiredChecksFromRuleset, slugify, tokenState, validReviewerLgtm,
   verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
@@ -21,6 +21,21 @@ test('slugify produces bounded branch-safe names', () => {
 
 test('labelsOf accepts GitHub label objects', () => {
   assert.deepEqual(labelsOf({ labels: [{ name: 'status:approved' }, { name: 'repo:tasco' }] }), ['status:approved', 'repo:tasco']);
+});
+
+test('release gate authorization is exact to PR #103 and six documents', () => {
+  const docs = [
+    'acceptance-matrix.md', 'consistency-report.md', 'design.md',
+    'reviewer-bot-design.md', 'revision-notes.md', 'sha256-list.md',
+  ];
+  for (const name of docs) {
+    assert.equal(isApprovedReleaseGateFile('sunSUNQ/issue-pilot', 103, `policies/governance-v2/${name}`), true);
+    assert.equal(isApprovedReleaseGateFile('sunSUNQ/issue-pilot', 104, `policies/governance-v2/${name}`), false);
+  }
+  assert.equal(isApprovedReleaseGateFile('sunSUNQ/provenlattice', 103, 'policies/governance-v2/design.md'), false);
+  assert.equal(isApprovedReleaseGateFile('sunSUNQ/issue-pilot', 103, 'policies/solo-mode.md'), false);
+  assert.equal(isApprovedReleaseGateFile('sunSUNQ/issue-pilot', 103, 'policies/governance-v2/extra.md'), false);
+  assert.equal(isApprovedReleaseGateFile('sunSUNQ/issue-pilot', 103, '.github/workflows/control-plane-policy.yml'), false);
 });
 
 test('tokenState passes through outside enforced sessions', () => {
