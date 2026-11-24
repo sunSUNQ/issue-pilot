@@ -4,10 +4,10 @@ import path from 'node:path';
 import {
   assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
   detectOwnerTransfer, ensurePathOnD, fail, issue, labelsOf, loadConfig,
-  loadState, missingAutoElements, parseArgs, productGh, repoAliasOf,
-  requireIssueOwner, requiredChecksFromRuleset, root, run, runShell, saveState,
-  setNeed, setStatus, slugify, soloMode, statePath, verifyLauncherIdentity,
-  worktreePath,
+  loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
+  parseArgs, productGh, repoAliasOf, requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
+  saveState, setNeed, setStatus, slugify, soloMode, statePath,
+  validReviewerLgtm, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -371,7 +371,8 @@ function review(config, number, flags) {
     repository: repo.github,
     control_repository: config.issueRepository,
     reviewer_verdict: verdict,
-    reviewed_head_sha: (verdict === 'lgtm' || verdict === 'changes') ? ciHeadSha : null,
+    // P1-2：BLOCKED 也绑定到当前待审 SHA，使后续 BLOCKED 能失效同 SHA 的旧 LGTM。
+    reviewed_head_sha: headForReview,
     reviewed_at: new Date().toISOString(),
     review_url: null,
   };
@@ -449,25 +450,14 @@ function getRequiredChecks(config, repo, base) {
 }
 
 // canEnterReview(pr)：Check Runs 与 Commit Status 分别匹配（字段不同，不混用）。
-// fail-closed：pending/skipped/neutral/cancelled/timed_out/stale/缺失 → 不满足。
+// G10：重复 check 聚合下沉为纯函数 missingRequiredChecks，按
+// (context, integration_id) 取最新有效记录，重跑 / 顺序 / 同名异 App
+// 均 fail-closed 且确定。
 function canEnterReview(config, repo, base, headSha) {
   const required = getRequiredChecks(config, repo, base);
   const checkRuns = JSON.parse(productGh(['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
   const statuses = JSON.parse(productGh(['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
-  const missing = [];
-  for (const { context, integration_id } of required) {
-    const cr = checkRuns.find((c) => c.name === context && (integration_id == null || c.app?.id === integration_id));
-    if (cr) {
-      if (cr.status !== 'completed') { missing.push(`${context}: status=${cr.status}（未完成）`); continue; }
-      if (cr.conclusion !== 'success') { missing.push(`${context}: conclusion=${cr.conclusion}（非 success）`); continue; }
-      continue;
-    }
-    if (integration_id == null) {
-      const cs = statuses.find((s) => s.context === context);
-      if (cs && cs.state === 'success') continue;
-    }
-    missing.push(`${context}: 缺失或不成功（integration_id=${integration_id ?? 'null'}）`);
-  }
+  const missing = missingRequiredChecks(required, checkRuns, statuses);
   if (missing.length) return { ready: false, head_sha: headSha, required, missing };
   return { ready: true, head_sha: headSha, required };
 }
@@ -499,15 +489,6 @@ function ci(config, number) {
   }
 }
 
-// 独立有效 LGTM：launcher_role=reviewer 且 reviewed_head_sha == headSha。
-// Repo Owner 自审（owner 角色）不满足 merge 独立性（Q3 铁律）。
-function validReviewerLgtm(state, headSha) {
-  const reviews = state.reviews ?? [];
-  return reviews.filter((r) =>
-    r.reviewer_verdict === 'lgtm' && r.launcher_role === 'reviewer' && r.reviewed_head_sha === headSha,
-  ).pop() ?? null;
-}
-
 // merge <issue> --verdict merge|rework — Repo Owner 唯一 merge 门（§5-9/§5-18）。
 function merge(config, number, flags) {
   const verdict = flags.verdict;
@@ -535,6 +516,8 @@ function merge(config, number, flags) {
   const failures = [];
   const lgtm = validReviewerLgtm(state, headSha);
   if (!lgtm) failures.push(`无有效 reviewer LGTM（需 launcher_role=reviewer 且 reviewed_head_sha=${headSha.slice(0, 8)}）`);
+  const blocks = outstandingBlocks(state, headSha);
+  if (blocks.length) failures.push(`存在未解决的 reviewer 阻塞裁决（${blocks.map((b) => `${b.principal}:${b.verdict}`).join('、')}）—— 需 author 处理后由该 reviewer 重新 review 至 LGTM`);
   const checks = canEnterReview(config, repo, repo.base, headSha);
   if (!checks.ready) failures.push(`Required Checks @head 未全绿：${checks.missing.join('; ')}`);
   const violations = gateAudit(config, repo, pr.number);
@@ -715,6 +698,8 @@ function autoMerge(config, item, alias, repo, state) {
   }
   const lgtm = validReviewerLgtm(state, head);
   if (!lgtm) return '尚无有效 reviewer LGTM（SHA 绑定）';
+  const blocks = outstandingBlocks(state, head);
+  if (blocks.length) return `存在未解决的 reviewer 阻塞裁决（${blocks.map((b) => `${b.principal}:${b.verdict}`).join('、')}）—— 需 author 处理后由该 reviewer 重新 review 至 LGTM`;
   const checks = canEnterReview(config, repo, repo.base, head);
   if (!checks.ready) return `CI 未全绿：${checks.missing.join('; ')}`;
   const violations = gateAudit(config, repo, pr.number);

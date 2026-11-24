@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
-import { auditFooter, labelsOf, mintAppToken, parseArgs, requiredChecksFromRuleset, slugify, tokenState, writeAudit } from '../scripts/lib.mjs';
+import {
+  auditFooter, labelsOf, mintAppToken, missingRequiredChecks, outstandingBlocks,
+  parseArgs, requiredChecksFromRuleset, slugify, tokenState, validReviewerLgtm,
+  verifyLauncherIdentity, writeAudit,
+} from '../scripts/lib.mjs';
 
 test('parseArgs separates positionals and flags', () => {
   assert.deepEqual(
@@ -67,21 +71,43 @@ test('control plane keeps no silent OAuth fallback path (R16)', async () => {
 
 // --- G11: control-repo write audit (role -> principal -> writer_login -> repo -> operation) ---
 const CAST_CFG = { issueRepository: 'sunSUNQ/issue-pilot' };
+
+// Hard-pinned identity constants (mirror scripts/lib.mjs; launchers hardcode the same).
+const READ_BOTS = {
+  reviewer: 'pl-issue-reviewer-read[bot]',
+  owner: 'pl-owner-reviewer[bot]',
+  worker: 'pl-issue-worker[bot]',
+};
+const WRITE_BOTS = {
+  reviewer: 'pl-issue-reviewer-write[bot]',
+  owner: 'pl-owner-control-write[bot]',
+  worker: 'pl-worker-control-write[bot]',
+};
+const PRINCIPALS = {
+  reviewer: 'pl-issue-reviewer[bot]',
+  owner: 'sunSUNQ',
+  worker: 'pl-issue-worker[bot]',
+};
+
 function g11Env(role, writeBot) {
-  const principal = role === 'owner' ? 'sunSUNQ'
-    : role === 'worker' ? 'pl-issue-worker[bot]' : 'pl-issue-reviewer[bot]';
-  const tokenBot = role === 'owner' ? 'pl-owner-reviewer[bot]'
-    : role === 'worker' ? 'pl-issue-worker[bot]' : 'pl-issue-reviewer-read[bot]';
   return {
-    PL_ENFORCE_APP: '1', PL_ROLE: role, PL_PRINCIPAL: principal,
-    PL_GITHUB_LOGIN: tokenBot, PL_TOKEN_BOT: tokenBot, PL_EXPECTED_BOT: tokenBot,
+    PL_ENFORCE_APP: '1', PL_ROLE: role, PL_PRINCIPAL: PRINCIPALS[role],
+    PL_GITHUB_LOGIN: READ_BOTS[role],
+    PL_GIT_TOKEN: 'read-token',
     PL_WRITE_GIT_TOKEN: 'write-token',
     PL_WRITE_TOKEN_BOT: writeBot, PL_WRITE_EXPECTED_BOT: writeBot,
   };
 }
 
+// Stub identity resolver: maps the placeholder tokens to the role's real bots.
+// No network — mirrors what resolveTokenLoginDefault would answer.
+function resolveStub(readBot, writeBot) {
+  return (token) => (token === 'read-token' ? readBot : token === 'write-token' ? writeBot : null);
+}
+
 test('G11 writeAudit exposes the full traceable chain', () => {
-  const a = writeAudit(CAST_CFG, 'propose', g11Env('worker', 'pl-worker-control-write[bot]'));
+  const a = writeAudit(CAST_CFG, 'propose', g11Env('worker', WRITE_BOTS.worker),
+    { resolveTokenLogin: resolveStub(READ_BOTS.worker, WRITE_BOTS.worker) });
   assert.equal(a.role, 'worker');
   assert.equal(a.principal, 'pl-issue-worker[bot]');
   assert.equal(a.writer_login, 'pl-worker-control-write[bot]');
@@ -90,13 +116,15 @@ test('G11 writeAudit exposes the full traceable chain', () => {
 });
 
 test('G11 owner audit binds writer_login to the control-write App bot, not the principal', () => {
-  const a = writeAudit(CAST_CFG, 'merge', g11Env('owner', 'pl-owner-control-write[bot]'));
+  const a = writeAudit(CAST_CFG, 'merge', g11Env('owner', WRITE_BOTS.owner),
+    { resolveTokenLogin: resolveStub(READ_BOTS.owner, WRITE_BOTS.owner) });
   assert.equal(a.principal, 'sunSUNQ');
   assert.equal(a.writer_login, 'pl-owner-control-write[bot]');
 });
 
 test('G11 auditFooter embeds all five fields', () => {
-  const footer = auditFooter(CAST_CFG, 'ci', g11Env('worker', 'pl-worker-control-write[bot]'));
+  const footer = auditFooter(CAST_CFG, 'ci', g11Env('worker', WRITE_BOTS.worker),
+    { resolveTokenLogin: resolveStub(READ_BOTS.worker, WRITE_BOTS.worker) });
   assert.ok(footer.includes('role=`worker`'));
   assert.ok(footer.includes('principal=`pl-issue-worker[bot]`'));
   assert.ok(footer.includes('writer_login=`pl-worker-control-write[bot]`'));
@@ -106,7 +134,7 @@ test('G11 auditFooter embeds all five fields', () => {
 
 test('G11 writeAudit fails closed outside a launcher session', () => {
   assert.throws(() => writeAudit(CAST_CFG, 'propose', { PL_ENFORCE_APP: '0' }), /PL_ENFORCE_APP/);
-  const noPrincipal = { ...g11Env('worker', 'pl-worker-control-write[bot]') };
+  const noPrincipal = { ...g11Env('worker', WRITE_BOTS.worker) };
   delete noPrincipal.PL_PRINCIPAL;
   assert.throws(() => writeAudit(CAST_CFG, 'propose', noPrincipal), /PL_PRINCIPAL/);
 });
@@ -155,4 +183,240 @@ test('requiredChecksFromRuleset ignores non-status rules and non-applying rulese
   assert.deepEqual(requiredChecksFromRuleset({ ...detail, enforcement: 'disabled' }, 'e2e-validation'), []);
   assert.deepEqual(requiredChecksFromRuleset({ ...detail, target: 'tag' }, 'e2e-validation'), []);
   assert.deepEqual(requiredChecksFromRuleset({ ...detail, conditions: { ref_name: { include: ['main'] } } }, 'e2e-validation'), []);
+});
+
+// --- P1-1: verifyLauncherIdentity binds the ACTUAL token identity to the role ---
+// (stub resolver replaces the real `gh api graphql`; no network in tests)
+
+function idEnv(role, readToken, writeToken) {
+  return {
+    PL_ENFORCE_APP: '1',
+    PL_ROLE: role,
+    PL_PRINCIPAL: PRINCIPALS[role],
+    PL_GITHUB_LOGIN: READ_BOTS[role],
+    PL_GIT_TOKEN: readToken,
+    PL_WRITE_GIT_TOKEN: writeToken,
+  };
+}
+
+const reviewerResolve = resolveStub(READ_BOTS.reviewer, WRITE_BOTS.reviewer);
+const workerResolve = resolveStub(READ_BOTS.worker, WRITE_BOTS.worker);
+const ownerResolve = resolveStub(READ_BOTS.owner, WRITE_BOTS.owner);
+
+test('P1-1 reviewer session resolves to reviewer identity with both bots bound', () => {
+  const id = verifyLauncherIdentity(idEnv('reviewer', 'read-token', 'write-token'), { resolveTokenLogin: reviewerResolve });
+  assert.equal(id.role, 'reviewer');
+  assert.equal(id.principal, 'pl-issue-reviewer[bot]');
+  assert.equal(id.tokenBot, 'pl-issue-reviewer-read[bot]');
+  assert.equal(id.writeTokenBot, 'pl-issue-reviewer-write[bot]');
+});
+
+test('P1-1 worker session resolves to worker identity', () => {
+  const id = verifyLauncherIdentity(idEnv('worker', 'read-token', 'write-token'), { resolveTokenLogin: workerResolve });
+  assert.equal(id.role, 'worker');
+  assert.equal(id.tokenBot, 'pl-issue-worker[bot]');
+  assert.equal(id.writeTokenBot, 'pl-worker-control-write[bot]');
+});
+
+test('P1-1 owner session resolves to owner identity (human principal + bot tokens)', () => {
+  const id = verifyLauncherIdentity(idEnv('owner', 'read-token', 'write-token'), { resolveTokenLogin: ownerResolve });
+  assert.equal(id.role, 'owner');
+  assert.equal(id.principal, 'sunSUNQ');
+  assert.equal(id.tokenBot, 'pl-owner-reviewer[bot]');
+  assert.equal(id.writeTokenBot, 'pl-owner-control-write[bot]');
+});
+
+test('P1-1 worker cannot impersonate reviewer (real token identity mismatch)', () => {
+  // Attacker holds worker tokens but declares reviewer role + principal.
+  assert.throws(
+    () => verifyLauncherIdentity(idEnv('reviewer', 'read-token', 'write-token'), { resolveTokenLogin: workerResolve }),
+    /主 token 真实身份 .* 与 role=reviewer 不符/,
+  );
+});
+
+test('P1-1 forged write token is rejected (write bot mismatch)', () => {
+  const badWrite = (token) => (token === 'read-token' ? READ_BOTS.reviewer : 'pl-worker-control-write[bot]');
+  assert.throws(
+    () => verifyLauncherIdentity(idEnv('reviewer', 'read-token', 'write-token'), { resolveTokenLogin: badWrite }),
+    /写侧 token 真实身份 .* 与 role=reviewer 不符/,
+  );
+});
+
+test('P1-1 missing primary token fails closed', () => {
+  const env = idEnv('worker', 'read-token', 'write-token');
+  delete env.PL_GIT_TOKEN;
+  assert.throws(() => verifyLauncherIdentity(env, { resolveTokenLogin: workerResolve }), /主 token 缺失/);
+});
+
+test('P1-1 caller-set PL_TOKEN_BOT/PL_EXPECTED_BOT are ignored (no trust in env self-assertion)', () => {
+  // Even with a self-consistent PL_TOKEN_BOT===PL_EXPECTED_BOT that lies about the
+  // bot, the real token resolution is authoritative and wins.
+  const env = {
+    ...idEnv('reviewer', 'read-token', 'write-token'),
+    PL_TOKEN_BOT: 'pl-issue-reviewer-read[bot]',
+    PL_EXPECTED_BOT: 'pl-issue-reviewer-read[bot]',
+  };
+  const id = verifyLauncherIdentity(env, { resolveTokenLogin: reviewerResolve });
+  assert.equal(id.tokenBot, 'pl-issue-reviewer-read[bot]');
+});
+
+test('P1-1 write identity is resolved from the exact token used for control writes', () => {
+  // The audit's writer_login must reflect the SAME token that controlGh()/
+  // writeTokenEnv() uses for the actual write — i.e. env.PL_WRITE_GIT_TOKEN.
+  const env = idEnv('reviewer', 'read-token', 'write-token');
+  const seen = [];
+  const resolve = (token, kind) => {
+    seen.push([kind, token]);
+    return token === 'read-token' ? READ_BOTS.reviewer : token === 'write-token' ? WRITE_BOTS.reviewer : null;
+  };
+  const id = verifyLauncherIdentity(env, { resolveTokenLogin: resolve });
+  assert.deepEqual(seen, [['read', 'read-token'], ['write', 'write-token']]);
+  assert.equal(env.PL_WRITE_GIT_TOKEN, 'write-token');
+  assert.equal(id.writeTokenBot, WRITE_BOTS.reviewer);
+});
+
+// --- P1-2: validReviewerLgtm — later CHANGES/BLOCKED invalidates an earlier LGTM ---
+
+function review(verdict, principal, sha, at) {
+  return {
+    reviewer_verdict: verdict, launcher_role: 'reviewer', principal,
+    reviewed_head_sha: sha, reviewed_at: at,
+  };
+}
+
+const R = 'pl-issue-reviewer[bot]';
+const OTHER = 'pl-issue-reviewer-2[bot]';
+
+test('P1-2 LGTM then CHANGES on same SHA invalidates the LGTM', () => {
+  const state = { reviews: [review('lgtm', R, 'sha1', '2026-11-24T00:00:00Z'), review('changes', R, 'sha1', '2026-11-24T00:01:00Z')] };
+  assert.equal(validReviewerLgtm(state, 'sha1'), null);
+});
+
+test('P1-2 LGTM then BLOCKED on same SHA invalidates the LGTM', () => {
+  const state = { reviews: [review('lgtm', R, 'sha1', '2026-11-24T00:00:00Z'), review('blocked', R, 'sha1', '2026-11-24T00:01:00Z')] };
+  assert.equal(validReviewerLgtm(state, 'sha1'), null);
+});
+
+test('P1-2 historical LGTM on a different SHA is isolated', () => {
+  const state = { reviews: [review('lgtm', R, 'sha-old', '2026-11-24T00:00:00Z'), review('changes', R, 'sha-new', '2026-11-24T00:01:00Z')] };
+  assert.equal(validReviewerLgtm(state, 'sha-new'), null);
+  assert.equal(validReviewerLgtm(state, 'sha-old').reviewer_verdict, 'lgtm');
+});
+
+test('P1-2 records from different reviewers are isolated', () => {
+  const state = { reviews: [review('lgtm', R, 'sha1', '2026-11-24T00:00:00Z'), review('changes', OTHER, 'sha1', '2026-11-24T00:01:00Z')] };
+  const lgtm = validReviewerLgtm(state, 'sha1');
+  assert.equal(lgtm.principal, R);
+});
+
+test('P1-2 a standalone valid LGTM is returned', () => {
+  const state = { reviews: [review('lgtm', R, 'sha1', '2026-11-24T00:00:00Z')] };
+  assert.equal(validReviewerLgtm(state, 'sha1').reviewer_verdict, 'lgtm');
+});
+
+test('P1-2 owner self-review (non-reviewer role) never counts as valid LGTM', () => {
+  const state = { reviews: [{ reviewer_verdict: 'lgtm', launcher_role: 'owner', principal: 'sunSUNQ', reviewed_head_sha: 'sha1', reviewed_at: '2026-11-24T00:00:00Z' }] };
+  assert.equal(validReviewerLgtm(state, 'sha1'), null);
+});
+
+// --- P1-2 (cross-reviewer): outstandingBlocks — CHANGES or BLOCKED from any reviewer blocks merge ---
+
+test('P1-2 cross-reviewer: another reviewer CHANGES surfaces as blocking without invalidating the LGTM', () => {
+  const state = { reviews: [review('lgtm', R, 'sha1', 'T0'), review('changes', OTHER, 'sha1', 'T1')] };
+  assert.equal(validReviewerLgtm(state, 'sha1').principal, R); // per-reviewer isolation preserved
+  assert.deepEqual(outstandingBlocks(state, 'sha1'), [{ principal: OTHER, verdict: 'changes' }]); // but the objection blocks merge
+});
+
+test('P1-2 cross-reviewer: CHANGES later superseded by the same reviewer LGTM no longer blocks', () => {
+  const state = { reviews: [review('changes', OTHER, 'sha1', 'T0'), review('lgtm', OTHER, 'sha1', 'T1')] };
+  assert.deepEqual(outstandingBlocks(state, 'sha1'), []);
+});
+
+test('P1-2 cross-reviewer: CHANGES on a different SHA is isolated (does not block current head)', () => {
+  const state = { reviews: [review('changes', OTHER, 'sha-old', 'T0')] };
+  assert.deepEqual(outstandingBlocks(state, 'sha1'), []);
+});
+
+test('P1-2 cross-reviewer: BLOCKED blocks merge even with another reviewer LGTM (unfinished review, not a defect)', () => {
+  const state = { reviews: [review('lgtm', R, 'sha1', 'T0'), review('blocked', OTHER, 'sha1', 'T1')] };
+  assert.deepEqual(outstandingBlocks(state, 'sha1'), [{ principal: OTHER, verdict: 'blocked' }]);
+});
+
+test('P1-2 cross-reviewer: BLOCKED later superseded by the same reviewer LGTM no longer blocks', () => {
+  const state = { reviews: [review('blocked', OTHER, 'sha1', 'T0'), review('lgtm', OTHER, 'sha1', 'T1')] };
+  assert.deepEqual(outstandingBlocks(state, 'sha1'), []);
+});
+
+// --- G10: missingRequiredChecks — re-run / order / same-name-different-App aggregation ---
+
+const REQUIRED_ONE = [{ context: 'contract', integration_id: 15368 }];
+const T0 = '2026-11-24T10:00:00Z';
+const T1 = '2026-11-24T11:00:00Z';
+const run = (over = {}) => ({
+  id: 1, name: 'contract', app: { id: 15368 }, status: 'completed',
+  conclusion: 'success', started_at: T0, completed_at: T0, ...over,
+});
+
+test('G10 failure then success re-run satisfies (newest run id wins)', () => {
+  const runs = [run({ id: 1, conclusion: 'failure' }), run({ id: 2, conclusion: 'success' })];
+  assert.deepEqual(missingRequiredChecks(REQUIRED_ONE, runs, []), []);
+});
+
+test('G10 success then failure does not satisfy (newest run id wins)', () => {
+  const runs = [run({ id: 1, conclusion: 'success' }), run({ id: 2, conclusion: 'failure' })];
+  assert.deepEqual(missingRequiredChecks(REQUIRED_ONE, runs, []).length, 1);
+});
+
+test('G10 result is independent of API order (shuffled input)', () => {
+  const success = run({ id: 2, conclusion: 'success' });
+  const failure = run({ id: 1, conclusion: 'failure' });
+  assert.deepEqual(missingRequiredChecks(REQUIRED_ONE, [failure, success], []), []);
+  assert.deepEqual(missingRequiredChecks(REQUIRED_ONE, [success, failure], []), []);
+});
+
+test('G10 pending run fails closed', () => {
+  const runs = [run({ status: 'in_progress', conclusion: null })];
+  const missing = missingRequiredChecks(REQUIRED_ONE, runs, []);
+  assert.equal(missing.length, 1);
+  assert.match(missing[0], /未完成/);
+});
+
+test('G10 pending re-run is not masked by an earlier success', () => {
+  // The reviewer's key case: a success completed earlier (lower id), then a re-run
+  // still in_progress (higher id). The newest run is authoritative -> not ready.
+  const success = run({ id: 1, conclusion: 'success' });
+  const reRunInProgress = run({ id: 2, status: 'in_progress', conclusion: null, completed_at: null });
+  const missing = missingRequiredChecks(REQUIRED_ONE, [success, reRunInProgress], []);
+  assert.equal(missing.length, 1);
+  assert.match(missing[0], /未完成/);
+  assert.equal(missingRequiredChecks(REQUIRED_ONE, [reRunInProgress, success], []).length, 1);
+});
+
+test('G10 skipped / neutral conclusions fail closed', () => {
+  assert.equal(missingRequiredChecks(REQUIRED_ONE, [run({ conclusion: 'skipped' })], []).length, 1);
+  assert.equal(missingRequiredChecks(REQUIRED_ONE, [run({ conclusion: 'neutral' })], []).length, 1);
+});
+
+test('G10 missing check fails closed', () => {
+  assert.equal(missingRequiredChecks(REQUIRED_ONE, [], []).length, 1);
+});
+
+test('G10 same-name checks from different Apps are independent', () => {
+  const required = [
+    { context: 'contract', integration_id: 15368 },
+    { context: 'contract', integration_id: 99999 },
+  ];
+  const runs = [run({ app: { id: 15368 }, conclusion: 'success' })];
+  // App 99999 has no run -> its required check is missing, even though 15368 passed.
+  const missing = missingRequiredChecks(required, runs, []);
+  assert.equal(missing.length, 1);
+  assert.match(missing[0], /integration_id=99999/);
+});
+
+test('G10 commit-status fallback only applies when integration_id is null', () => {
+  const required = [{ context: 'legacy', integration_id: null }];
+  assert.deepEqual(missingRequiredChecks(required, [], [{ context: 'legacy', state: 'success', updated_at: T0 }]), []);
+  assert.equal(missingRequiredChecks(required, [], [{ context: 'legacy', state: 'pending', updated_at: T0 }]).length, 1);
+  // integration_id != null ignores commit statuses entirely.
+  assert.equal(missingRequiredChecks(REQUIRED_ONE, [], [{ context: 'contract', state: 'success', updated_at: T0 }]).length, 1);
 });

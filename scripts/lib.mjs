@@ -226,6 +226,16 @@ const ROLE_WRITE_BOTS = {
   worker: 'pl-worker-control-write[bot]',
 };
 
+// Per-role product/READ App bot — the actual GitHub actor for product-repo
+// (config.repositories[*]) reads/writes. Distinct from ROLE_WRITE_BOTS (control
+// repo) and from ROLE_PRINCIPALS (the governance principal). Hard-pinned in the
+// role launchers (start-{worker,reviewer,owner}-agent.ps1).
+const ROLE_READ_BOTS = {
+  reviewer: 'pl-issue-reviewer-read[bot]',
+  owner: 'pl-owner-reviewer[bot]',
+  worker: 'pl-issue-worker[bot]',
+};
+
 // GitHub principal namespace: a human login or a bot login (`<name>[bot]`).
 // Rejects free-form strings so PL_PRINCIPAL is only ever compared against
 // assignees in the same namespace (reviewer-bot-design.md §3 "命名空间").
@@ -246,8 +256,32 @@ export function requireIssueOwner(assignee) {
   return assignee;
 }
 
+// Query the real login a GitHub token acts as, trusting only GitHub's answer —
+// never any caller-set PL_* env var. Uses `gh api graphql` (no credential read
+// from disk; the token is passed in-memory via env). Any anomaly fails closed.
+function resolveTokenLoginDefault(token, kind, env) {
+  const result = run('gh', ['api', 'graphql', '-f', 'query=query{viewer{login}}'], {
+    env: { ...env, GH_TOKEN: token, GITHUB_TOKEN: token },
+    tokenContext: 'control',
+    noRetry401: true,
+    allowFailure: true,
+  });
+  if (result.status !== 0) {
+    fail(`身份校验失败：${kind} token 真实身份查询失败（fail-closed）：${(result.stderr || `exit ${result.status}`).trim()}`);
+  }
+  let login = '';
+  try { login = JSON.parse(result.stdout)?.data?.viewer?.login ?? ''; } catch { login = ''; }
+  if (!login) fail(`身份校验失败：${kind} token 无法解析真实登录名（fail-closed）`);
+  return login;
+}
+
 // verifyLauncherIdentity — generic + role-specific launcher identity checks.
 // Fail-closed on any anomaly (R7 constraints 1–6 / §4 通用校验 + 角色专属校验).
+//
+// P1-1: the ACTUAL token identity is resolved from GitHub and bound to the role
+// via hard-pinned ROLE_READ_BOTS / ROLE_WRITE_BOTS. Caller-set PL_TOKEN_BOT /
+// PL_EXPECTED_BOT / PL_WRITE_TOKEN_BOT / PL_WRITE_EXPECTED_BOT are NOT trusted
+// as evidence of identity. Any mismatch fails closed.
 // Returns the normalized identity (role / principal / githubLogin / tokenBot).
 export function verifyLauncherIdentity(env = process.env, opts = {}) {
   if (env.PL_ENFORCE_APP !== '1') {
@@ -256,9 +290,6 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
   const role = env.PL_ROLE;
   if (!['worker', 'reviewer', 'owner'].includes(role)) {
     fail(`身份校验失败：PL_ROLE 缺失或非法（${role ?? '(unset)'}）`);
-  }
-  if (!env.PL_TOKEN_BOT || !env.PL_EXPECTED_BOT || env.PL_TOKEN_BOT !== env.PL_EXPECTED_BOT) {
-    fail(`身份校验失败：token 身份不符（${env.PL_TOKEN_BOT ?? '(unset)'} != ${env.PL_EXPECTED_BOT ?? '(unset)'}）`);
   }
   const principal = env.PL_PRINCIPAL;
   const expectedPrincipal = ROLE_PRINCIPALS[role];
@@ -269,26 +300,37 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
       fail(`身份校验失败：PL_PRINCIPAL 与 role 不符（${principal}，期望 ${expectedPrincipal}）`);
     }
   }
-  // 双 App 写侧（Plan A）：任意角色注入 PL_WRITE_GIT_TOKEN 时，写侧 bot 必须
-  // 自校验通过（§4 通用校验第 3 条）。期望值按 role 区分，不复制 reviewer 身份。
+
+  const resolve = opts.resolveTokenLogin ?? resolveTokenLoginDefault;
+
+  // 主（product/read）token 的真实身份必须等于该角色钉扎的 READ bot。
+  const primaryToken = env.PL_GIT_TOKEN || env.GH_TOKEN || null;
+  if (!primaryToken) fail('身份校验失败：主 token 缺失（fail-closed）');
+  const primaryExpected = ROLE_READ_BOTS[role];
+  const primaryLogin = resolve(primaryToken, 'read', env);
+  if (!primaryLogin) fail('身份校验失败：主 token 无法解析真实身份（fail-closed）');
+  if (primaryLogin !== primaryExpected) {
+    fail(`身份校验失败：主 token 真实身份 ${primaryLogin} 与 role=${role} 不符（期望 ${primaryExpected}，fail-closed）`);
+  }
+
+  // 写（control）token 的真实身份必须等于该角色钉扎的 WRITE bot（双 App 模型）。
+  let writeLogin = null;
   if (env.PL_WRITE_GIT_TOKEN) {
-    const writeBot = env.PL_WRITE_TOKEN_BOT;
-    const writeExpected = env.PL_WRITE_EXPECTED_BOT;
-    if (!writeBot || !writeExpected || writeBot !== writeExpected) {
-      fail(`身份校验失败：${role} 写侧 token 身份不符（fail-closed）`);
-    }
-    const expectedWrite = ROLE_WRITE_BOTS[role];
-    if (writeBot !== expectedWrite) {
-      fail(`身份校验失败：${role} 写侧 bot 不符（${writeBot}，期望 ${expectedWrite}）`);
+    const writeExpected = ROLE_WRITE_BOTS[role];
+    writeLogin = resolve(env.PL_WRITE_GIT_TOKEN, 'write', env);
+    if (!writeLogin) fail('身份校验失败：写侧 token 无法解析真实身份（fail-closed）');
+    if (writeLogin !== writeExpected) {
+      fail(`身份校验失败：写侧 token 真实身份 ${writeLogin} 与 role=${role} 不符（期望 ${writeExpected}，fail-closed）`);
     }
   }
+
   return {
     role,
     principal,
-    githubLogin: env.PL_GITHUB_LOGIN || env.PL_TOKEN_BOT,
-    tokenBot: env.PL_TOKEN_BOT,
+    githubLogin: env.PL_GITHUB_LOGIN || primaryLogin,
+    tokenBot: primaryLogin,
     // 实际执行 GitHub 写操作的身份（reviewer 双 App 为写侧 bot；单 App 为 null）
-    writeTokenBot: env.PL_WRITE_TOKEN_BOT ?? null,
+    writeTokenBot: writeLogin,
   };
 }
 
@@ -296,8 +338,8 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
 // write must expose the traceable chain role -> principal -> writer_login ->
 // repository -> operation (not just review). Calls verifyLauncherIdentity, so
 // any control-repo write outside a valid launcher session fails closed.
-export function writeAudit(config, operation, env = process.env) {
-  const identity = verifyLauncherIdentity(env);
+export function writeAudit(config, operation, env = process.env, opts = {}) {
+  const identity = verifyLauncherIdentity(env, opts);
   return {
     role: identity.role,
     principal: identity.principal,
@@ -308,8 +350,8 @@ export function writeAudit(config, operation, env = process.env) {
 }
 
 // Markdown footer appended to every control-repo operation comment (audit trail).
-export function auditFooter(config, operation, env = process.env) {
-  const a = writeAudit(config, operation, env);
+export function auditFooter(config, operation, env = process.env, opts = {}) {
+  const a = writeAudit(config, operation, env, opts);
   return [
     '',
     '---',
@@ -379,6 +421,120 @@ export function requiredChecksFromRuleset(rs, base) {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// P1-2 / G10 pure helpers (testable without network)
+// ---------------------------------------------------------------------------
+
+// validReviewerLgtm — a reviewer LGTM is valid only if it is that reviewer's
+// LATEST verdict for the given head SHA. Any later CHANGES/BLOCKED from the same
+// reviewer on the same SHA supersedes (invalidates) an earlier LGTM. Records are
+// isolated by (role, principal, reviewed_head_sha). Replaces the old
+// "filter(lgtm).pop()" logic, which could not see a later non-LGTM verdict.
+export function validReviewerLgtm(state, headSha) {
+  const reviews = state.reviews ?? [];
+  const latest = new Map();
+  for (const r of reviews) {
+    const key = `${r.launcher_role ?? ''}\u0000${r.principal ?? ''}\u0000${r.reviewed_head_sha ?? ''}`;
+    // Reviews are appended in order: a later element is a later review -> overwrite.
+    latest.set(key, r);
+  }
+  for (const r of latest.values()) {
+    if (r.reviewer_verdict === 'lgtm' && r.launcher_role === 'reviewer' && r.reviewed_head_sha === headSha) {
+      return r;
+    }
+  }
+  return null;
+}
+
+// outstandingBlocks — reviewers whose LATEST verdict for headSha is a blocking
+// verdict (changes / blocked). Both block merge, per Owner rule:
+//   - LGTM    -> valid approval.
+//   - CHANGES -> block merge until that reviewer's subsequent LGTM.
+//   - BLOCKED -> block merge until the blocker is resolved and review completes
+//                (BLOCKED is NOT a code defect, but it is NOT an approval either).
+// A block is NOT cleared by a DIFFERENT reviewer's LGTM; only the same reviewer's
+// later LGTM on the same SHA clears it. Records isolated per (role, principal, sha).
+export function outstandingBlocks(state, headSha) {
+  const reviews = state.reviews ?? [];
+  const latest = new Map();
+  for (const r of reviews) {
+    const key = `${r.launcher_role ?? ''}\u0000${r.principal ?? ''}\u0000${r.reviewed_head_sha ?? ''}`;
+    latest.set(key, r);
+  }
+  const blockers = [];
+  for (const r of latest.values()) {
+    if (r.reviewed_head_sha !== headSha) continue;
+    if (r.reviewer_verdict === 'changes' || r.reviewer_verdict === 'blocked') {
+      blockers.push({ principal: r.principal, verdict: r.reviewer_verdict });
+    }
+  }
+  return blockers;
+}
+
+// Latest check run for a (context, integration_id) group, independent of API
+// order. Recency key is the run `id` (monotonic: a re-run gets a HIGHER id and is
+// always present), with `started_at` as tiebreak. This matters: a pending/in-
+// progress re-run has completed_at=null, so sorting by completed_at would push it
+// to the bottom and let an earlier success mask it. Sorting by id keeps the newest
+// (possibly still-running) run authoritative -> fail-closed on pending.
+function latestCheckRun(runs) {
+  return [...runs].sort((a, b) => {
+    const idA = Number(a.id) || 0;
+    const idB = Number(b.id) || 0;
+    if (idA !== idB) return idB - idA;
+    const ta = Date.parse(a.started_at ?? '') || 0;
+    const tb = Date.parse(b.started_at ?? '') || 0;
+    return tb - ta;
+  })[0];
+}
+
+// Latest commit status for a context, independent of API order (updated_at desc).
+function latestCommitStatus(statuses) {
+  return [...statuses].sort((a, b) => {
+    const ta = Date.parse(a.updated_at ?? a.created_at ?? '') || 0;
+    const tb = Date.parse(b.updated_at ?? b.created_at ?? '') || 0;
+    return tb - ta;
+  })[0];
+}
+
+// missingRequiredChecks — evaluate required checks against check runs + commit
+// statuses, fail-closed. Returns human-readable failures (empty = all satisfied).
+// Rules:
+//   - A required check is satisfied only by its LATEST run/status (re-run aware).
+//   - Only conclusion 'success' (runs) / state 'success' (statuses) satisfies.
+//   - pending / queued / in_progress / skipped / neutral / failure / missing are
+//     all fail-closed (non-satisfying).
+//   - Grouping is by (context, integration_id); same-name checks from different
+//     Apps are independent.
+export function missingRequiredChecks(required, checkRuns, statuses) {
+  const missing = [];
+  for (const { context, integration_id } of required) {
+    const runs = checkRuns.filter((c) =>
+      c.name === context && (integration_id == null || (c.app?.id ?? null) === integration_id));
+    if (runs.length > 0) {
+      const latest = latestCheckRun(runs);
+      if (latest.status !== 'completed') {
+        missing.push(`${context}: status=${latest.status}（未完成）`);
+      } else if (latest.conclusion !== 'success') {
+        missing.push(`${context}: conclusion=${latest.conclusion ?? '(null)'}（非 success，fail-closed）`);
+      }
+      continue;
+    }
+    if (integration_id == null) {
+      const matching = statuses.filter((s) => s.context === context);
+      if (matching.length > 0) {
+        const latest = latestCommitStatus(matching);
+        if (latest.state !== 'success') {
+          missing.push(`${context}: state=${latest.state ?? '(null)'}（非 success）`);
+        }
+        continue;
+      }
+    }
+    missing.push(`${context}: 缺失或不成功（integration_id=${integration_id ?? 'null'}）`);
+  }
+  return missing;
 }
 
 // decision ④ / E15：assignee 变化时记录 OwnerTransfer 事件（审计留痕）。
