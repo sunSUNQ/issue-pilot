@@ -2,11 +2,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
+  assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
   detectOwnerTransfer, ensurePathOnD, fail, issue, labelsOf, loadConfig,
   loadState, missingAutoElements, parseArgs, productGh, repoAliasOf,
-  requireIssueOwner, root, run, runShell, saveState, setNeed, setStatus,
-  slugify, soloMode, statePath, verifyLauncherIdentity, worktreePath,
+  requireIssueOwner, requiredChecksFromRuleset, root, run, runShell, saveState,
+  setNeed, setStatus, slugify, soloMode, statePath, verifyLauncherIdentity,
+  worktreePath,
 } from './lib.mjs';
 
 const STATUS_COLORS = {
@@ -409,13 +410,6 @@ function review(config, number, flags) {
 // CI Gate（design §6）：Required Checks 权威来源 + canEnterReview 三分匹配
 // ---------------------------------------------------------------------------
 
-function rulesetApplies(rs, base) {
-  if (rs.enforcement !== 'active') return false;
-  if (rs.target !== 'branch') return false;
-  const include = rs.conditions?.ref_name?.include ?? [];
-  return include.includes('~DEFAULT_BRANCH') || include.includes(base);
-}
-
 // getRequiredChecks(repo, base) -> [{ context, integration_id|null }]
 // Rulesets + Branch Protection 双查取并集，key=(context, integration_id) 去重。
 // 空并集或 Rulesets 不可读 → fail-closed；BP 404 属预期（跳过）。
@@ -429,15 +423,13 @@ function getRequiredChecks(config, repo, base) {
     required.push({ context, integration_id: integrationId ?? null });
   };
 
-  // 1) Rulesets（现代权威来源）
+  // 1) Rulesets（现代权威来源）。LIST 端点仅返回摘要（无 rules/conditions），
+  // 需逐 id 取 DETAIL，再由 requiredChecksFromRuleset 提取必检项。
   const rsList = JSON.parse(productGh(['api', `repos/${repo.github}/rulesets`]).stdout);
-  for (const rs of rsList) {
-    if (!rulesetApplies(rs, base)) continue;
-    for (const rule of rs.rules ?? []) {
-      if (rule.type !== 'required_status_checks') continue;
-      for (const sc of rule.parameters?.required_status_checks ?? []) {
-        add(sc.context, sc.integration_id ?? null);
-      }
+  for (const summary of rsList) {
+    const rs = JSON.parse(productGh(['api', `repos/${repo.github}/rulesets/${summary.id}`]).stdout);
+    for (const check of requiredChecksFromRuleset(rs, base)) {
+      add(check.context, check.integration_id);
     }
   }
 

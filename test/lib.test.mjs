@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
-import { auditFooter, labelsOf, mintAppToken, parseArgs, slugify, tokenState, writeAudit } from '../scripts/lib.mjs';
+import { auditFooter, labelsOf, mintAppToken, parseArgs, requiredChecksFromRuleset, slugify, tokenState, writeAudit } from '../scripts/lib.mjs';
 
 test('parseArgs separates positionals and flags', () => {
   assert.deepEqual(
@@ -109,4 +109,50 @@ test('G11 writeAudit fails closed outside a launcher session', () => {
   const noPrincipal = { ...g11Env('worker', 'pl-worker-control-write[bot]') };
   delete noPrincipal.PL_PRINCIPAL;
   assert.throws(() => writeAudit(CAST_CFG, 'propose', noPrincipal), /PL_PRINCIPAL/);
+});
+
+// --- Finding 5: ruleset required-checks extraction (LIST endpoint has no rules/conditions) ---
+const RS_DETAIL = {
+  id: 25471662,
+  name: 'provenlattice-main-protection',
+  target: 'branch',
+  enforcement: 'active',
+  conditions: { ref_name: { exclude: [], include: ['~DEFAULT_BRANCH'] } },
+  rules: [
+    { type: 'deletion' },
+    { type: 'non_fast_forward' },
+    { type: 'pull_request', parameters: { required_approving_review_count: 0 } },
+    {
+      type: 'required_status_checks',
+      parameters: {
+        required_status_checks: [
+          { context: 'test-windows', integration_id: 15368 },
+          { context: 'test-linux', integration_id: 15368 },
+          { context: 'linux-jdt-verify', integration_id: 15368 },
+        ],
+      },
+    },
+  ],
+};
+
+test('requiredChecksFromRuleset extracts required_status_checks with integration_id', () => {
+  assert.deepEqual(requiredChecksFromRuleset(RS_DETAIL, 'e2e-validation'), [
+    { context: 'test-windows', integration_id: 15368 },
+    { context: 'test-linux', integration_id: 15368 },
+    { context: 'linux-jdt-verify', integration_id: 15368 },
+  ]);
+});
+
+test('requiredChecksFromRuleset ignores non-status rules and non-applying rulesets', () => {
+  const detail = {
+    ...RS_DETAIL,
+    rules: [
+      { type: 'deletion' },
+      { type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'x', integration_id: 1 }] } },
+    ],
+  };
+  assert.deepEqual(requiredChecksFromRuleset(detail, 'e2e-validation'), [{ context: 'x', integration_id: 1 }]);
+  assert.deepEqual(requiredChecksFromRuleset({ ...detail, enforcement: 'disabled' }, 'e2e-validation'), []);
+  assert.deepEqual(requiredChecksFromRuleset({ ...detail, target: 'tag' }, 'e2e-validation'), []);
+  assert.deepEqual(requiredChecksFromRuleset({ ...detail, conditions: { ref_name: { include: ['main'] } } }, 'e2e-validation'), []);
 });

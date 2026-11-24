@@ -361,6 +361,26 @@ export function productGh(args, options = {}) {
   return run('gh', args, options);
 }
 
+// Required-checks extraction from a single ruleset DETAIL object (pure, testable).
+// The GitHub rulesets LIST endpoint returns only a summary (no `conditions`/`rules`),
+// so callers must fetch each ruleset's DETAIL first. Returns the required_status_checks
+// entries ({ context, integration_id|null }) when the ruleset applies to `base`;
+// otherwise [].
+export function requiredChecksFromRuleset(rs, base) {
+  if (rs.enforcement !== 'active') return [];
+  if (rs.target !== 'branch') return [];
+  const include = rs.conditions?.ref_name?.include ?? [];
+  if (!(include.includes('~DEFAULT_BRANCH') || include.includes(base))) return [];
+  const out = [];
+  for (const rule of rs.rules ?? []) {
+    if (rule.type !== 'required_status_checks') continue;
+    for (const sc of rule.parameters?.required_status_checks ?? []) {
+      out.push({ context: sc.context, integration_id: sc.integration_id ?? null });
+    }
+  }
+  return out;
+}
+
 // decision ④ / E15：assignee 变化时记录 OwnerTransfer 事件（审计留痕）。
 // 首次记录当前 assignee 作为基线；后续变化 append 到 state.ownerTransfers。
 export function detectOwnerTransfer(config, alias, number, issue) {
