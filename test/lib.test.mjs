@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
-  auditFooter, isApprovedReleaseGateFile, labelsOf, mintAppToken, missingRequiredChecks, outstandingBlocks,
-  parseArgs, requiredChecksFromRuleset, slugify, tokenState, validReviewerLgtm,
-  verifyLauncherIdentity, writeAudit,
+  auditFooter, controlRepoAlias, isApprovedReleaseGateFile, labelsOf, mintAppToken, missingRequiredChecks,
+  outstandingBlocks, parseArgs, prIdentityViolations, repoAliasOf, repoDescriptor, requiredChecksFromRuleset,
+  slugify, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
 
 test('parseArgs separates positionals and flags', () => {
@@ -434,4 +434,73 @@ test('G10 commit-status fallback only applies when integration_id is null', () =
   assert.equal(missingRequiredChecks(required, [], [{ context: 'legacy', state: 'pending', updated_at: T0 }]).length, 1);
   // integration_id != null ignores commit statuses entirely.
   assert.equal(missingRequiredChecks(REQUIRED_ONE, [], [{ context: 'contract', state: 'success', updated_at: T0 }]).length, 1);
+});
+
+// --- R3: control-repo self-route + PR identity / uniqueness validation ---
+
+const R3_CFG = {
+  issueRepository: 'sunSUNQ/issue-pilot',
+  worktreeRoot: 'D:\\tasco-temp\\issue-pilot\\worktrees',
+  repositories: {
+    tasco: { github: 'sunSUNQ/tasco-dev', base: 'main', policy: 'tasco', checks: [], path: 'C:\\tasco' },
+  },
+};
+
+const R3_PR = {
+  number: 103, repository: 'sunSUNQ/issue-pilot',
+  headRefOid: '5214f525ae7207ed4ceb446e3e1d7d332d203436',
+  headRefName: 'governance-v2-release-candidate',
+  baseRefName: 'main', state: 'OPEN',
+};
+
+test('R3 controlRepoAlias derives the short repo name from issueRepository', () => {
+  assert.equal(controlRepoAlias(R3_CFG), 'issue-pilot');
+  assert.equal(controlRepoAlias({ issueRepository: 'acme/foo-bar' }), 'foo-bar');
+  assert.equal(controlRepoAlias({}), '');
+});
+
+test('R3 repoDescriptor returns a registered product repo unchanged', () => {
+  const d = repoDescriptor(R3_CFG, 'tasco');
+  assert.equal(d.isControlRepo, false);
+  assert.equal(d.github, 'sunSUNQ/tasco-dev');
+  assert.equal(d.base, 'main');
+  assert.equal(d.policy, 'tasco');
+  assert.deepEqual(d.checks, []);
+});
+
+test('R3 repoDescriptor synthesizes the control repo for the issue-pilot alias', () => {
+  const d = repoDescriptor(R3_CFG, 'issue-pilot');
+  assert.equal(d.isControlRepo, true);
+  assert.equal(d.github, 'sunSUNQ/issue-pilot');
+  assert.equal(d.base, 'main');
+});
+
+test('R3 repoDescriptor fails closed on an unknown alias', () => {
+  assert.throws(() => repoDescriptor(R3_CFG, 'nope'), /未注册仓库 nope/);
+});
+
+test('R3 repoAliasOf accepts the control-repo alias without registration', () => {
+  const alias = repoAliasOf({ number: 101, labels: [{ name: 'repo:issue-pilot' }] }, R3_CFG);
+  assert.equal(alias, 'issue-pilot');
+});
+
+test('R3 prIdentityViolations is empty when every pinned field matches', () => {
+  const v = prIdentityViolations(R3_PR, {
+    repository: 'sunSUNQ/issue-pilot', number: 103, base: 'main',
+    head: 'governance-v2-release-candidate', sha: R3_PR.headRefOid,
+  });
+  assert.deepEqual(v, []);
+});
+
+test('R3 prIdentityViolations flags repository / number / base / head / sha mismatches', () => {
+  assert.equal(prIdentityViolations({ ...R3_PR, repository: 'other/repo' }, { repository: 'sunSUNQ/issue-pilot' }).length, 1);
+  assert.equal(prIdentityViolations(R3_PR, { number: 999 }).length, 1);
+  assert.equal(prIdentityViolations(R3_PR, { base: 'develop' }).length, 1);
+  assert.equal(prIdentityViolations(R3_PR, { head: 'other-branch' }).length, 1);
+  assert.equal(prIdentityViolations(R3_PR, { sha: 'deadbeef' }).length, 1);
+});
+
+test('R3 prIdentityViolations ignores unpinned fields (optional binding)', () => {
+  const v = prIdentityViolations(R3_PR, { number: 103 });
+  assert.deepEqual(v, []);
 });

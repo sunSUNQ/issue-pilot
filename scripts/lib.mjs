@@ -189,8 +189,77 @@ export function repoAliasOf(issue, config) {
   const label = labels.find((item) => item.startsWith('repo:'));
   if (!label) fail(`Issue #${issue.number} 缺少 repo:<alias> label。`);
   const alias = label.slice(5);
-  if (!config.repositories[alias]) fail(`repos.local.json 未注册仓库 ${alias}。`);
+  if (!config.repositories[alias] && alias !== controlRepoAlias(config)) {
+    fail(`repos.local.json 未注册仓库 ${alias}。`);
+  }
   return alias;
+}
+
+// ---------------------------------------------------------------------------
+// R3 — control-repo self-route（governance-v2 控制仓发布 PR 路由）
+// ---------------------------------------------------------------------------
+
+// The control repo (config.issueRepository) is addressable as a target repo via
+// the `repo:<alias>` label when <alias> equals the issueRepository's short repo
+// name (e.g. `repo:issue-pilot` for `sunSUNQ/issue-pilot`). This is the only
+// alias that resolves WITHOUT an entry in config.repositories.
+export function controlRepoAlias(config) {
+  return (config.issueRepository ?? '').split('/').pop() ?? '';
+}
+
+// Resolve a repo alias to a descriptor. Product repos come from
+// config.repositories (registered aliases win, unchanged). The control repo is
+// synthesized (isControlRepo=true) when the alias matches controlRepoAlias.
+// Unknown aliases still fail closed.
+export function repoDescriptor(config, alias) {
+  const product = config.repositories[alias];
+  if (product) {
+    return {
+      alias,
+      isControlRepo: false,
+      github: product.github,
+      base: product.base ?? 'main',
+      policy: product.policy ?? alias,
+      checks: product.checks ?? [],
+      path: product.path,
+    };
+  }
+  if (alias && alias === controlRepoAlias(config)) {
+    return {
+      alias,
+      isControlRepo: true,
+      github: config.issueRepository,
+      base: 'main',
+      policy: 'governance-v2',
+      checks: [],
+      path: root,
+    };
+  }
+  fail(`repos.local.json 未注册仓库 ${alias}。`);
+}
+
+// R3 — PR identity / uniqueness validation (pure, testable). `expected` pins the
+// fields the caller resolved the PR by (repository / number / base / head branch /
+// HEAD SHA — each optional). Returns an array of human-readable violations; an
+// empty array means the PR matches every pinned field.
+export function prIdentityViolations(pr, expected = {}) {
+  const violations = [];
+  if (expected.repository && pr.repository !== expected.repository) {
+    violations.push(`PR #${pr.number} 不属于仓库 ${expected.repository}（实际 ${pr.repository}）`);
+  }
+  if (expected.number != null && expected.number !== pr.number) {
+    violations.push(`PR #${pr.number} != 期望 PR #${expected.number}`);
+  }
+  if (expected.base && pr.baseRefName !== expected.base) {
+    violations.push(`PR #${pr.number} base ${pr.baseRefName} != 期望 ${expected.base}`);
+  }
+  if (expected.head && pr.headRefName !== expected.head) {
+    violations.push(`PR #${pr.number} head branch ${pr.headRefName} != 期望 ${expected.head}`);
+  }
+  if (expected.sha && pr.headRefOid !== expected.sha) {
+    violations.push(`PR #${pr.number} HEAD ${pr.headRefOid} != 期望 ${expected.sha}`);
+  }
+  return violations;
 }
 
 export function issue(config, number) {

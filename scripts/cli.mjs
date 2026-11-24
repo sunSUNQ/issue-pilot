@@ -5,7 +5,8 @@ import {
   assertNoRoleOverride, assertSingleAssignee, auditFooter, controlGh,
   detectOwnerTransfer, ensurePathOnD, fail, isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
   loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
-  parseArgs, productGh, repoAliasOf, requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
+  parseArgs, prIdentityViolations, productGh, repoAliasOf, repoDescriptor,
+  requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
   saveState, setNeed, setStatus, slugify, soloMode, statePath,
   validReviewerLgtm, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
@@ -208,7 +209,7 @@ function startRun(config, number) {
   const item = issue(config, number);
   if (!labelsOf(item).includes('status:approved')) fail(`#${number} 尚未 approved。`);
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const target = worktreePath(config, alias, number);
   ensurePathOnD(target);
   if (fs.existsSync(target)) fail(`worktree 已存在：${target}`);
@@ -231,7 +232,7 @@ function startRun(config, number) {
 function submit(config, number) {
   const item = issue(config, number);
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const target = worktreePath(config, alias, number);
   if (!fs.existsSync(target)) fail(`worktree 不存在：${target}`);
   const status = run('git', ['-C', target, 'status', '--porcelain']).stdout;
@@ -337,11 +338,10 @@ function review(config, number, flags) {
 
   // 4. 三态前置判定（消除 SHA 循环依赖）：ciHeadSha / PR head / --sha
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const state = loadState(config, alias, number);
   const ciHeadSha = state.ciHeadSha;
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const pr = findPr(config, repo, branch);
+  const pr = findPr(config, repo, number, item, state);
   if (!pr) fail('未找到开放 PR');
   const prHead = pr.headRefOid;
 
@@ -424,18 +424,20 @@ function getRequiredChecks(config, repo, base) {
     required.push({ context, integration_id: integrationId ?? null });
   };
 
+  const gh = repoAccess(config, repo);
+
   // 1) Rulesets（现代权威来源）。LIST 端点仅返回摘要（无 rules/conditions），
   // 需逐 id 取 DETAIL，再由 requiredChecksFromRuleset 提取必检项。
-  const rsList = JSON.parse(productGh(['api', `repos/${repo.github}/rulesets`]).stdout);
+  const rsList = JSON.parse(gh(['api', `repos/${repo.github}/rulesets`]).stdout);
   for (const summary of rsList) {
-    const rs = JSON.parse(productGh(['api', `repos/${repo.github}/rulesets/${summary.id}`]).stdout);
+    const rs = JSON.parse(gh(['api', `repos/${repo.github}/rulesets/${summary.id}`]).stdout);
     for (const check of requiredChecksFromRuleset(rs, base)) {
       add(check.context, check.integration_id);
     }
   }
 
   // 2) 传统 Branch Protection（404 预期跳过；403/500 等 fail-closed）
-  const bp = productGh(['api', `repos/${repo.github}/branches/${base}/protection`], { allowFailure: true });
+  const bp = gh(['api', `repos/${repo.github}/branches/${base}/protection`], { allowFailure: true });
   if (bp.status === 0) {
     const data = JSON.parse(bp.stdout);
     for (const ctx of data.required_status_checks?.contexts ?? []) add(ctx, null);
@@ -455,8 +457,9 @@ function getRequiredChecks(config, repo, base) {
 // 均 fail-closed 且确定。
 function canEnterReview(config, repo, base, headSha) {
   const required = getRequiredChecks(config, repo, base);
-  const checkRuns = JSON.parse(productGh(['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
-  const statuses = JSON.parse(productGh(['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
+  const gh = repoAccess(config, repo);
+  const checkRuns = JSON.parse(gh(['api', `repos/${repo.github}/commits/${headSha}/check-runs`]).stdout).check_runs ?? [];
+  const statuses = JSON.parse(gh(['api', `repos/${repo.github}/commits/${headSha}/status`]).stdout).statuses ?? [];
   const missing = missingRequiredChecks(required, checkRuns, statuses);
   if (missing.length) return { ready: false, head_sha: headSha, required, missing };
   return { ready: true, head_sha: headSha, required };
@@ -467,9 +470,9 @@ function canEnterReview(config, repo, base, headSha) {
 function ci(config, number) {
   const item = issue(config, number);
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const pr = findPr(config, repo, branch);
+  const repo = repoDescriptor(config, alias);
+  const state = loadState(config, alias, number);
+  const pr = findPr(config, repo, number, item, state);
   if (!pr) fail('未找到开放 PR');
   if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
   const headSha = pr.headRefOid;
@@ -502,12 +505,11 @@ function merge(config, number, flags) {
   // 2. 读 issue + state
   const item = issue(config, number);
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const state = loadState(config, alias, number);
 
   // 3. PR + head
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const pr = findPr(config, repo, branch);
+  const pr = findPr(config, repo, number, item, state);
   if (!pr) fail('未找到开放 PR');
   if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
   const headSha = pr.headRefOid;
@@ -525,8 +527,16 @@ function merge(config, number, flags) {
 
   if (verdict === 'merge') {
     if (failures.length) fail(`merge 四门重检失败：\n- ${failures.join('\n- ')}`);
-    productGh(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
-    const merged = JSON.parse(productGh(['pr', 'view', String(pr.number), '-R', repo.github,
+    if (repo.isControlRepo) {
+      // R3：控制仓发布 PR 的物理合并需 Contents/Pulls:Write on issue-pilot，
+      // 七 App 中无任何 role token 具备该权限；由 Repo Owner 或 Release Publisher
+      // App 显式执行（App-only，不绕过门禁，不直接 merge main）。
+      fail(`控制仓发布 PR 的物理合并超出七 App 权限范围：请由 Repo Owner 或 `
+        + `Release Publisher（pl-release-publisher[bot]）在确认 LGTM + CI 全绿 + gate 0 命中后显式合并。`
+        + `\n四门重检已通过：\n- LGTM（reviewer）：${lgtm.review_id}\n- HEAD：\`${headSha.slice(0, 12)}\``);
+    }
+    repoAccess(config, repo)(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge']);
+    const merged = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(pr.number), '-R', repo.github,
       '--json', 'mergeCommit,state']).stdout);
     const mergedSha = merged.mergeCommit?.oid ?? null;
     saveState(config, alias, number, {
@@ -650,18 +660,59 @@ function autoApprove(config, item) {
   return null;
 }
 
-function findPr(config, repo, branch) {
-  const out = productGh(['pr', 'list', '-R', repo.github, '--head', branch,
-    '--state', 'all', '--json', 'number,url,headRefOid,state'], { allowFailure: true });
+// R3 token routing：控制仓（repo.isControlRepo）的 PR/check-runs/rulesets 读写绑定
+// 控制写侧 App token（controlGh）；产品仓保持主 product token（productGh），路由不变。
+function repoAccess(config, repo) {
+  return repo.isControlRepo ? controlGh : productGh;
+}
+
+const PR_JSON_FIELDS = 'number,url,headRefOid,headRefName,baseRefName,state';
+
+// R3 — resolve the PR for an issue + repo. Two modes:
+//   1. Explicit binding（控制仓发布 / 任意显式绑定）：state.prNumber 钉扎 PR，
+//      取回后做身份唯一性校验（repository / number / base / head branch / 可选 SHA）。
+//   2. Branch inference（产品仓，行为不变）：按 issue-pilot/<n>-<slug> 分支列 PR，
+//      多开放 PR 歧义时 fail-closed（需显式绑定）。
+// 返回 PR 对象（含 repository 字段）或 null（未找到，由调用方失败并说明）。
+function findPr(config, repo, number, item, state) {
+  const gh = repoAccess(config, repo);
+
+  if (repo.isControlRepo) {
+    if (state?.prNumber == null) {
+      fail(`控制仓发布 PR 需显式绑定（state.prNumber），记录 Issue↔PR 绑定后重试。`);
+    }
+    const pr = JSON.parse(gh(['pr', 'view', String(state.prNumber), '-R', repo.github,
+      '--json', PR_JSON_FIELDS]).stdout);
+    pr.repository = repo.github;
+    const violations = prIdentityViolations(pr, {
+      repository: repo.github,
+      number: state.prNumber,
+      base: state.prBase ?? repo.base,
+      head: state.prBranch ?? null,
+      sha: state.prHeadSha ?? null,
+    });
+    if (violations.length) fail(`PR 身份校验失败（fail-closed）：\n- ${violations.join('\n- ')}`);
+    if (pr.state !== 'OPEN') fail(`PR #${pr.number} 状态 ${pr.state}`);
+    return pr;
+  }
+
+  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
+  const out = gh(['pr', 'list', '-R', repo.github, '--head', branch,
+    '--state', 'all', '--json', PR_JSON_FIELDS], { allowFailure: true });
   const prs = JSON.parse(out.stdout || '[]');
-  return prs.find((pr) => pr.state === 'OPEN') ?? prs[0] ?? null;
+  const open = prs.filter((pr) => pr.state === 'OPEN');
+  if (open.length > 1) fail(`PR 歧义：分支 \`${branch}\` 有 ${open.length} 个开放 PR（需显式绑定 prNumber）`);
+  const pr = open[0] ?? prs[0] ?? null;
+  if (pr) pr.repository = repo.github;
+  return pr;
 }
 
 function gateAudit(config, repo, prNumber) {
-  const files = JSON.parse(productGh(['pr', 'view', String(prNumber), '-R', repo.github,
+  const gh = repoAccess(config, repo);
+  const files = JSON.parse(gh(['pr', 'view', String(prNumber), '-R', repo.github,
     '--json', 'files']).stdout).files;
   const violations = [];
-  const diff = productGh(['pr', 'diff', String(prNumber), '-R', repo.github],
+  const diff = gh(['pr', 'diff', String(prNumber), '-R', repo.github],
     { allowFailure: true }).stdout;
   const added = diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++'));
   for (const file of files) {
@@ -689,8 +740,7 @@ function gateAudit(config, repo, prNumber) {
 
 function autoMerge(config, item, alias, repo, state) {
   const number = item.number;
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const pr = findPr(config, repo, branch);
+  const pr = findPr(config, repo, number, item, state);
   if (!pr) return '未找到开放 PR';
   if (pr.state !== 'OPEN') return `PR #${pr.number} 状态 ${pr.state}`;
   const head = pr.headRefOid;
@@ -724,10 +774,9 @@ function autoMerge(config, item, alias, repo, state) {
 
 function autoVerify(config, item, alias, repo, state) {
   const number = item.number;
-  const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-  const found = findPr(config, repo, branch);
+  const found = findPr(config, repo, number, item, state);
   if (!found) return '未找到 PR';
-  const view = JSON.parse(productGh(['pr', 'view', String(found.number), '-R', repo.github,
+  const view = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(found.number), '-R', repo.github,
     '--json', 'state,mergeCommit,url']).stdout);
   if (view.state !== 'MERGED') return `PR #${found.number} 尚未合并`;
   const mergedSha = view.mergeCommit?.oid ?? state.mergedSha;
@@ -776,7 +825,7 @@ function advanceOnce(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') return { progress: false, reason: 'closed' };
   const alias = repoAliasOf(item, config);
-  const repo = config.repositories[alias];
+  const repo = repoDescriptor(config, alias);
   const status = statusOf(item);
   const state = loadState(config, alias, number);
   switch (status) {
@@ -806,8 +855,7 @@ function advanceOnce(config, number) {
         return { progress: false, reason: '无 commit（实现中）' };
       }
       submit(config, number);
-      const branch = `issue-pilot/${number}-${slugify(item.title)}`;
-      const pr = findPr(config, repo, branch);
+      const pr = findPr(config, repo, number, item, state);
       saveState(config, alias, number, {
         prUrl: pr?.url, head: pr?.headRefOid,
         submittedAt: new Date().toISOString(),
