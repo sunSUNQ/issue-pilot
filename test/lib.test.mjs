@@ -10,7 +10,7 @@ import {
   assertOwnerIdentity, auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
   isApprovedReleaseGateFile, labelsOf, mintAppToken,
   missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
-  repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo,
+  repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo, planReviewRecord, reviewKey,
   slugify, soloMode, soloScopeAllows, parseSoloScope, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
 
@@ -973,4 +973,106 @@ test('issue-122 atomicWriteJson writes atomically and leaves no temp file', () =
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// --- issue-pilot#111: verdict-change idempotency (latest record wins, review_seq) ---
+
+function planned(verdict, seq, url = 'url') {
+  return {
+    review_id: `r-${verdict}`,
+    launcher_role: 'reviewer', principal: R, reviewed_head_sha: 'sha1',
+    reviewer_verdict: verdict, review_url: url, review_seq: seq,
+  };
+}
+
+function incomingReview(verdict, principal = R) {
+  return {
+    review_id: `r-${verdict}`,
+    launcher_role: 'reviewer', principal, reviewed_head_sha: 'sha1',
+    reviewer_verdict: verdict, review_url: null,
+  };
+}
+
+function withUrls(plan, url) {
+  return plan.reviews.map((r) => ({ ...r, review_url: url }));
+}
+
+test('issue-111 LGTM -> CHANGES -> LGTM keeps the second LGTM with review_seq', () => {
+  let plan = planReviewRecord([], incomingReview('lgtm'));
+  assert.equal(plan.action, 'append');
+  assert.equal(plan.record.review_seq, 1);
+  let reviews = withUrls(plan, 'url1');
+
+  plan = planReviewRecord(reviews, incomingReview('changes'));
+  assert.equal(plan.action, 'append');
+  assert.equal(plan.record.review_seq, 1);
+  reviews = withUrls(plan, 'url2');
+
+  plan = planReviewRecord(reviews, incomingReview('lgtm'));
+  assert.equal(plan.action, 'append');
+  assert.equal(plan.record.review_seq, 2); // same review_id as the first LGTM
+  reviews = withUrls(plan, 'url3');
+
+  assert.equal(reviews.length, 3);
+  assert.deepEqual(reviews.map((r) => [r.reviewer_verdict, r.review_seq]), [
+    ['lgtm', 1], ['changes', 1], ['lgtm', 2],
+  ]);
+  const state = { reviews };
+  assert.equal(validReviewerLgtm(state, 'sha1').review_seq, 2);
+  assert.deepEqual(outstandingBlocks(state, 'sha1'), []);
+});
+
+test('issue-111 repeating the latest LGTM is a no-op (no duplicate comment)', () => {
+  const reviews = [planned('lgtm', 1)];
+  const plan = planReviewRecord(reviews, incomingReview('lgtm'));
+  assert.equal(plan.action, 'noop');
+  assert.equal(plan.reviews.length, 1);
+});
+
+test('issue-111 same verdict without review_url resumes the same record (no new seq)', () => {
+  const reviews = [planned('lgtm', 1, null)];
+  const plan = planReviewRecord(reviews, incomingReview('lgtm'));
+  assert.equal(plan.action, 'resume');
+  assert.equal(plan.record.review_seq, 1);
+  assert.equal(plan.reviews.length, 1);
+});
+
+test('issue-111 CHANGES -> LGTM -> CHANGES stays blocking', () => {
+  let plan = planReviewRecord([], incomingReview('changes'));
+  let reviews = withUrls(plan, 'u1');
+  plan = planReviewRecord(reviews, incomingReview('lgtm'));
+  reviews = withUrls(plan, 'u2');
+  plan = planReviewRecord(reviews, incomingReview('changes'));
+  reviews = withUrls(plan, 'u3');
+
+  assert.equal(reviews.length, 3);
+  assert.equal(validReviewerLgtm({ reviews }, 'sha1'), null);
+  assert.deepEqual(outstandingBlocks({ reviews }, 'sha1'), [{ principal: R, verdict: 'changes' }]);
+});
+
+test('issue-111 different reviewers are planned independently', () => {
+  const otherChanges = { ...incomingReview('changes', OTHER), review_id: 'r-other-changes' };
+  let plan = planReviewRecord([], otherChanges);
+  const reviews = withUrls(plan, 'u1');
+  plan = planReviewRecord(reviews, incomingReview('lgtm'));
+  assert.equal(plan.action, 'append');
+  assert.equal(plan.record.review_seq, 1);
+  assert.equal(validReviewerLgtm({ reviews: plan.reviews }, 'sha1').principal, R);
+});
+
+test('issue-111 foldStateEvents keeps same review_id with different review_seq', () => {
+  const r1 = { review_id: 'r-lgtm', reviewed_head_sha: 'a'.repeat(40), reviewer_verdict: 'lgtm', review_seq: 1 };
+  const r1b = { ...r1, review_seq: 2 };
+  const state = foldStateEvents([
+    stateEvent('review', { review: r1 }),
+    stateEvent('review', { review: r1b }),
+  ]);
+  assert.equal(state.reviews.length, 2);
+  assert.deepEqual(state.reviews.map((r) => r.review_seq), [1, 2]);
+});
+
+test('issue-111 reviewKey treats legacy records as seq 0 and distinguishes seqs', () => {
+  assert.equal(reviewKey({ review_id: 'r', review_seq: 1 }), 'r#1');
+  assert.equal(reviewKey({ review_id: 'r' }), 'r#0');
+  assert.notEqual(reviewKey({ review_id: 'r', review_seq: 1 }), reviewKey({ review_id: 'r', review_seq: 2 }));
 });

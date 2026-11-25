@@ -681,6 +681,52 @@ export function outstandingBlocks(state, headSha) {
   return blockers;
 }
 
+// reviewKey — logical identity of a review record for state folding. Records
+// with the same review_id and review_seq are one record (replace); a later
+// verdict change reuses the review_id but bumps review_seq (append). Legacy
+// records without review_seq are treated as seq 0.
+export function reviewKey(record) {
+  return `${record?.review_id ?? ''}#${Number.isInteger(record?.review_seq) ? record.review_seq : 0}`;
+}
+
+// planReviewRecord — pure idempotency decision for `review` (issue-pilot#111).
+// The LATEST record for (launcher_role, principal, reviewed_head_sha) decides:
+//   - same verdict + review_url -> noop (comment already written; labels only)
+//   - same verdict, no url      -> resume the same record (no new seq)
+//   - different verdict / none  -> append a new record; a verdict seen before
+//     on this head gets review_seq = max(existing seq) + 1, so the earlier and
+//     later records both survive state folding and `state rebuild`.
+export function planReviewRecord(reviews, record) {
+  const list = Array.isArray(reviews) ? reviews : [];
+  const sameReviewer = (r) => r
+    && r.launcher_role === record.launcher_role
+    && r.principal === record.principal
+    && r.reviewed_head_sha === record.reviewed_head_sha;
+  let latestIndex = -1;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    if (sameReviewer(list[i])) { latestIndex = i; break; }
+  }
+  if (latestIndex >= 0) {
+    const latest = list[latestIndex];
+    if (latest.reviewer_verdict === record.reviewer_verdict) {
+      if (latest.review_url) return { action: 'noop', record: latest, reviews: list };
+      const resumed = {
+        ...record,
+        review_id: latest.review_id,
+        review_seq: Number.isInteger(latest.review_seq) ? latest.review_seq : 0,
+      };
+      const next = [...list];
+      next[latestIndex] = resumed;
+      return { action: 'resume', record: resumed, reviews: next };
+    }
+  }
+  const seq = Math.max(0, ...list
+    .filter((r) => r?.review_id === record.review_id)
+    .map((r) => (Number.isInteger(r.review_seq) ? r.review_seq : 0))) + 1;
+  const appended = { ...record, review_seq: seq };
+  return { action: 'append', record: appended, reviews: [...list, appended] };
+}
+
 // Latest check run for a (context, integration_id) group, independent of API
 // order. Recency key is the run `id` (monotonic: a re-run gets a HIGHER id and is
 // always present), with `started_at` as tiebreak. This matters: a pending/in-
@@ -1097,15 +1143,18 @@ export function foldStateEvents(events) {
           fail('review payload 缺 reviewed_head_sha');
         }
         const reviews = Array.isArray(state.reviews) ? [...state.reviews] : [];
-        const index = reviews.findIndex((item) => item.review_id === review.review_id);
-        if (index >= 0) {
-          if (reviews[index].reviewed_head_sha !== review.reviewed_head_sha) {
+        // Same review_id must always pin the same head SHA. A verdict change on
+        // that head reuses the review_id but carries a higher review_seq, so
+        // both records are preserved instead of overwriting each other.
+        for (const item of reviews) {
+          if (item.review_id === review.review_id && item.reviewed_head_sha !== review.reviewed_head_sha) {
             fail(`review_id ${review.review_id} 的 reviewed_head_sha 不一致（fail-closed）`);
           }
-          reviews[index] = review;
-        } else {
-          reviews.push(review);
         }
+        const key = reviewKey(review);
+        const index = reviews.findIndex((item) => reviewKey(item) === key);
+        if (index >= 0) reviews[index] = review;
+        else reviews.push(review);
         state.reviews = reviews;
         break;
       }
