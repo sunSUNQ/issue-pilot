@@ -238,6 +238,34 @@ export function repoDescriptor(config, alias) {
   fail(`repos.local.json 未注册仓库 ${alias}。`);
 }
 
+// propose --repo resolution: registered product aliases and the control-repo
+// self-route (e.g. issue-pilot) both resolve through repoDescriptor. Unknown
+// aliases fail closed as before.
+export function resolveProposeRepo(config, alias) {
+  if (!alias) fail('propose 需要 --repo <alias>。');
+  return repoDescriptor(config, alias);
+}
+
+// Control-repo submit transport gate (issue-pilot#110). The worker product App
+// is not installed on the control repo and the control-write App is Issues-only,
+// so git push / PR creation would fail only after side effects. Return an
+// explicit refusal before any side effect and hand transport to the existing
+// Owner-run release launcher; the resulting PR is bound with `bind`.
+export function controlRepoSubmitRefusal(repo, number, branch) {
+  if (!repo?.isControlRepo) return null;
+  return [
+    `控制仓 ${repo.github} 的 submit 需要 release launcher 传输（fail-closed）：`,
+    '- 当前 worker 会话的 product App 未安装到控制仓；control-write App 仅 Issues 写权限。',
+    '- 未执行任何 git push / PR 创建 / 标签或 state 变更。',
+    '',
+    '请 Issue Owner 使用既有 release launcher 完成传输：',
+    `  1) 从 worktree 推送分支 \`${branch}\`（base \`${repo.base}\`）`,
+    `  2) 以 base \`${repo.base}\` 创建 PR`,
+    '  3) 记录 PR 号与分支 HEAD SHA，然后执行显式绑定：',
+    `     npm run pilot -- bind ${number} --pr <PR_NUMBER> --branch ${branch} --base ${repo.base} --sha <HEAD_SHA>`,
+  ].join('\n');
+}
+
 // R3 — PR identity / uniqueness validation (pure, testable). `expected` pins the
 // fields the caller resolved the PR by (repository / number / base / head branch /
 // HEAD SHA — each optional). Returns an array of human-readable violations; an
