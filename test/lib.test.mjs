@@ -8,7 +8,7 @@ import {
   foldStateEvents, makeStateEnvelope, normalizeBodyForHash, parseStateComments, removeStateBlockLines,
   sha256Hex, stateRebuildSummary, validateStateComment, STATE_SCHEMA,
   assertOwnerIdentity, auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
-  isApprovedReleaseGateFile, labelsOf, mintAppToken,
+  isApprovedReleaseGateFile, labelsOf, mergeFailureHint, mintAppToken,
   missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
   repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo, planReviewRecord, reviewKey,
   slugify, soloMode, soloScopeAllows, parseSoloScope, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
@@ -1075,4 +1075,46 @@ test('issue-111 reviewKey treats legacy records as seq 0 and distinguishes seqs'
   assert.equal(reviewKey({ review_id: 'r', review_seq: 1 }), 'r#1');
   assert.equal(reviewKey({ review_id: 'r' }), 'r#0');
   assert.notEqual(reviewKey({ review_id: 'r', review_seq: 1 }), reviewKey({ review_id: 'r', review_seq: 2 }));
+});
+
+// --- issue-pilot#112: merge failure classification ---
+
+test('issue-112 mergeFailureHint classifies ruleset approval failure', () => {
+  const hint = mergeFailureHint(
+    'Pull request sunSUNQ/issue-pilot#103 is not mergeable: the base branch policy prohibits the merge.',
+    { isControlRepo: true },
+  );
+  assert.match(hint, /approval/);
+  assert.match(hint, /ruleset/);
+  assert.ok(!/权限不足/.test(hint));
+});
+
+test('issue-112 mergeFailureHint classifies required-review / required-check wording', () => {
+  assert.match(mergeFailureHint('At least 1 approving review is required', {}), /approval/);
+  assert.match(mergeFailureHint('Required status check "contract" is expected', {}), /approval|Required Checks/);
+});
+
+test('issue-112 mergeFailureHint classifies permission denial', () => {
+  assert.match(
+    mergeFailureHint('HTTP 403: Resource not accessible by integration', { isControlRepo: true }),
+    /pl-owner-control-write/,
+  );
+  assert.match(
+    mergeFailureHint('Permission denied for this action', { isControlRepo: false }),
+    /当前角色 App/,
+  );
+});
+
+test('issue-112 mergeFailureHint classifies conflicts', () => {
+  assert.match(mergeFailureHint('Pull request is not mergeable: merge conflict', {}), /冲突/);
+  assert.match(mergeFailureHint('CONFLICTING', {}), /冲突/);
+});
+
+test('issue-112 mergeFailureHint preserves unknown errors and ruleset precedence', () => {
+  assert.equal(mergeFailureHint('boom', {}), 'boom');
+  assert.match(
+    mergeFailureHint('Pull request is not mergeable: the base branch policy prohibits the merge.', {}),
+    /approval/,
+  );
+  assert.equal(mergeFailureHint('', {}), 'PR merge 失败（fail-closed，无错误输出）。');
 });

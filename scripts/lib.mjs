@@ -1210,6 +1210,24 @@ export function ownerTransferSnapshot(config, alias, number) {
   return { assignee: state.assignee ?? null, ownerTransfers: state.ownerTransfers ?? [] };
 }
 
+// issue-pilot#112 — classify merge failures so operators get the right next
+// action instead of a blanket App-permission hint. Pure/testable.
+export function mergeFailureHint(stderr, { isControlRepo = false } = {}) {
+  const text = String(stderr ?? '').trim();
+  if (/base branch policy prohibits the merge|approving review|required status check/i.test(text)) {
+    return 'GitHub ruleset 拒绝合并（fail-closed）：需在 PR 上提交正式 approval（至少 1 个），并确认 HEAD 的 Required Checks 全绿（ruleset `protect-main`）。';
+  }
+  if (/\b403\b|Resource not accessible|Permission denied|not authorized/i.test(text)) {
+    return isControlRepo
+      ? 'GitHub 权限不足（fail-closed）：检查 pl-owner-control-write 的 Contents:Write / Pull requests:Write 权限与 installation readback。'
+      : 'GitHub 权限不足（fail-closed）：检查当前角色 App 的 Contents:Write / Pull requests:Write 权限与 installation readback。';
+  }
+  if (/CONFLICTING|not mergeable|merge conflict|cannot be cleanly merged/i.test(text)) {
+    return 'PR 与 base 冲突（fail-closed）：先同步 main、解决冲突并重新提交；新 HEAD 需要重新 CI + 独立复审。';
+  }
+  return text || 'PR merge 失败（fail-closed，无错误输出）。';
+}
+
 export const AUTO_ELEMENTS = ['观察证据', '期望行为', '反例或失败条件', '允许修改范围', '验收方式'];
 
 // 反例要素兼容两种历史写法：模板 candidate.md / candidate.yml 用「反例与失败条件」，
