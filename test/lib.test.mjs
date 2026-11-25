@@ -6,7 +6,7 @@ import {
   isApprovedReleaseGateFile, labelsOf, mintAppToken,
   missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
   repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo,
-  slugify, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
+  slugify, soloMode, soloScopeAllows, parseSoloScope, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
 
 test('parseArgs separates positionals and flags', () => {
@@ -663,6 +663,30 @@ test('B1 branch inference still fails closed on ambiguous open PRs', () => {
     }),
     /PR 歧义/,
   );
+});
+
+test('Solo Mode scope parses only the first repo clause on the scope line', () => {
+  const text = '> 生效范围：repo:codegraph（sunSUNQ/provenlattice）；repo:tasco 暂不启用。';
+  assert.deepEqual(parseSoloScope(text), ['codegraph']);
+  assert.deepEqual(parseSoloScope('> 生效范围：repo:tasco；repo:codegraph'), ['tasco']);
+  assert.deepEqual(parseSoloScope('> 生效范围：'), []);
+  assert.deepEqual(parseSoloScope('> 状态：ACTIVE'), []);
+  assert.deepEqual(parseSoloScope('> 生效范围：未配置'), []);
+});
+
+test('Solo Mode scope allows only the configured repository alias', () => {
+  const solo = { enabled: true, phase: 'active', scope: ['codegraph'] };
+  assert.equal(soloScopeAllows(solo, 'codegraph'), true);
+  for (const alias of ['tasco', 'provenlattice', 'issue-pilot']) {
+    assert.equal(soloScopeAllows(solo, alias), false);
+  }
+  assert.equal(soloScopeAllows({ enabled: true, phase: 'active', scope: [] }, 'codegraph'), false);
+});
+
+test('Solo Mode reads the current policy scope without including disabled aliases', () => {
+  const solo = soloMode();
+  assert.equal(solo.phase, 'active');
+  assert.deepEqual(solo.scope, ['codegraph']);
 });
 
 // --- issue-pilot#110: control-repo author path (propose alias + submit precheck) ---

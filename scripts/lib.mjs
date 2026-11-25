@@ -752,13 +752,26 @@ export function ensurePathOnD(target) {
   }
 }
 
+export function parseSoloScope(text) {
+  const line = text.match(/^\s*>?\s*生效范围：([^\r\n]*)/m)?.[1];
+  if (!line) return [];
+  const alias = line.match(/repo:([a-z0-9][a-z0-9-]*)/i)?.[1];
+  return alias ? [alias.toLowerCase()] : [];
+}
+
+export function soloScopeAllows(solo, alias) {
+  return Array.isArray(solo?.scope) && solo.scope.includes(alias);
+}
+
 export function soloMode() {
   const file = path.join(root, 'policies', 'solo-mode.md');
-  if (!fs.existsSync(file)) return { enabled: false, phase: 'absent' };
-  const head = fs.readFileSync(file, 'utf8').split(/\r?\n/).slice(0, 4).join('\n');
-  if (head.includes('> 状态：**ACTIVE')) return { enabled: true, phase: 'active' };
-  if (head.includes('> 状态：**PILOT')) return { enabled: true, phase: 'pilot' };
-  return { enabled: false, phase: 'draft' };
+  if (!fs.existsSync(file)) return { enabled: false, phase: 'absent', scope: [] };
+  const text = fs.readFileSync(file, 'utf8');
+  const head = text.split(/\r?\n/).slice(0, 4).join('\n');
+  const scope = parseSoloScope(text);
+  if (head.includes('> 状态：**ACTIVE')) return { enabled: true, phase: 'active', scope };
+  if (head.includes('> 状态：**PILOT')) return { enabled: true, phase: 'pilot', scope };
+  return { enabled: false, phase: 'draft', scope };
 }
 
 export function statePath(config, alias, number) {

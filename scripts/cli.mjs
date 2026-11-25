@@ -9,7 +9,7 @@ import {
   parseArgs, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
   repoAccess, repoAliasOf, repoDescriptor, resolveProposeRepo,
   requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
-  saveState, setNeed, setStatus, slugify, soloMode, statePath,
+  saveState, setNeed, setStatus, slugify, soloMode, soloScopeAllows, statePath,
   validReviewerLgtm, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
@@ -858,6 +858,7 @@ function advanceOnce(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') return { progress: false, reason: 'closed' };
   const alias = repoAliasOf(item, config);
+  if (!soloScopeAllows(solo, alias)) return { progress: false, reason: 'Solo Mode 范围外：repo:' + alias };
   const repo = repoDescriptor(config, alias);
   const status = statusOf(item);
   const state = loadState(config, alias, number);
