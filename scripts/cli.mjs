@@ -2,14 +2,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertNoRoleOverride, assertOwnerIdentity, assertSingleAssignee, auditFooter, bindingRecord, controlGh,
-  controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, isApprovedReleaseGateFile,
-  issue, labelsOf, loadConfig,
-  loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
-  parseArgs, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
+  assertNoRoleOverride, assertOwnerIdentity, assertSingleAssignee, atomicWriteJson, auditFooter, bindingRecord,
+  controlGh, controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, foldStateEvents,
+  isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
+  loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks, ownerTransferSnapshot,
+  parseArgs, parseStateComments, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
   repoAccess, repoAliasOf, repoDescriptor, resolveProposeRepo,
   requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
-  saveState, setNeed, setStatus, slugify, soloMode, soloScopeAllows, statePath,
+  saveState, setNeed, setStatus, slugify, soloMode, soloScopeAllows, stateComment, statePath,
+  stateRebuildSummary, STATE_SCHEMA,
   validReviewerLgtm, verifyLauncherIdentity, worktreePath,
 } from './lib.mjs';
 
@@ -39,6 +40,7 @@ function usage() {
   submit <issue>
   bind <issue> --pr <n> [--branch <head>] [--base <base>] [--sha <commit>]
   ci <issue>
+  state rebuild <issue> [--dry-run]
   review <issue> --verdict <lgtm|changes|blocked> --sha <commit> [--note <text>]
   merge <issue> --verdict <merge|rework> [--reason <text>]
   verify <issue> --evidence-file <path>
@@ -208,10 +210,15 @@ function approveInternal(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') fail(`Issue #${number} 不是 OPEN。`);
   assertSingleAssignee(item);   // 决策④：0/多值 assignee 阻止 approve
-  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
+  const alias = repoAliasOf(item, config);
+  detectOwnerTransfer(config, alias, number, item);
+  const payload = ownerTransferSnapshot(config, alias, number);
   setStatus(config, number, 'approved');
   setNeed(config, number, 'author');
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `Owner gate：批准进入实现。${auditFooter(config, 'approve')}`]);
+  const body = stateComment(config, 'approve', {
+    issue: number, alias, type: 'owner-transfer', payload,
+  }, 'Owner gate：批准进入实现。');
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
   console.log(`#${number} -> approved`);
 }
 
@@ -230,12 +237,16 @@ function startRun(config, number) {
   run('git', ['-C', repo.path, 'worktree', 'add', '-b', branch, target, start]);
   setStatus(config, number, 'in-progress');
   setNeed(config, number, 'author');
-  saveState(config, alias, number, {
+  const runState = {
     launcherRole: process.env.PL_ROLE || null,
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
-  });
-  const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\`${auditFooter(config, 'run')}`;
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', note]);
+  };
+  saveState(config, alias, number, runState);
+  const note = `运行已开始。\n\n- 仓库：${alias}\n- 分支：\`${branch}\`\n- worktree：\`${target}\``;
+  const body = stateComment(config, 'run', {
+    issue: number, alias, type: 'run', payload: runState,
+  }, note);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
   console.log(target);
 }
 
@@ -284,15 +295,21 @@ function submit(config, number) {
       { principal: process.env.PL_PRINCIPAL ?? null, writeTokenBot: process.env.PL_WRITE_TOKEN_BOT ?? null },
     )
     : {};
+  const submittedAt = new Date().toISOString();
   saveState(config, alias, number, {
     prUrl: pr, head: headNow, branch: branchName, ...binding,
-    submittedAt: new Date().toISOString(),
+    submittedAt,
     launcherRole: process.env.PL_ROLE || null,
     githubLogin: process.env.PL_GITHUB_LOGIN || process.env.PL_TOKEN_BOT || null,
   });
   const bound = binding.prNumber ? `\n\n已写入显式绑定：PR #${binding.prNumber} @ \`${headNow.slice(0, 12)}\`。` : '';
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-    '--body', `PR 已提交：${pr}${bound}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。${auditFooter(config, 'submit')}`]);
+  const note = `PR 已提交：${pr}${bound}\n\n等待 CI 门禁（运行 \`npm run pilot -- ci ${number}\`）。`;
+  const commentBody = binding.prNumber
+    ? stateComment(config, 'submit', {
+      issue: number, alias, type: 'binding', payload: { ...binding, submittedAt },
+    }, note)
+    : `${note}${auditFooter(config, 'submit')}`;
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', commentBody]);
   console.log(pr);
 }
 
@@ -339,7 +356,7 @@ function bind(config, number, flags) {
 
   const record = bindingRecord(pr, identity);
   saveState(config, alias, number, record);
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', [
+  const note = [
     '## Issue ↔ PR 显式绑定',
     '',
     `- repository：\`${repo.github}\``,
@@ -352,8 +369,11 @@ function bind(config, number, flags) {
     `- bound_writer：\`${identity.writeTokenBot ?? identity.tokenBot}\``,
     '',
     '`findPr` 将按上述字段校验；HEAD 变化后需重新 `bind`。',
-    auditFooter(config, 'bind'),
-  ].join('\n')]);
+  ].join('\n');
+  const body = stateComment(config, 'bind', {
+    issue: number, alias, type: 'binding', payload: record,
+  }, note);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
   console.log(`#${number} ↔ PR #${pr.number} 已绑定（${pr.headRefOid.slice(0, 12)}）`);
 }
 
@@ -477,7 +497,10 @@ function review(config, number, flags) {
   saveState(config, alias, number, { reviews: nextReviews });
 
   // 7. 写评论（控制写侧 token）
-  const body = reviewCommentBody(verdict, record, blockedReason, flags.note);
+  const note = reviewCommentBody(verdict, record, blockedReason, flags.note);
+  const body = stateComment(config, 'review', {
+    issue: number, alias, type: 'review', payload: { review: record },
+  }, note);
   const commentOut = controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
 
   // 8. 回填 review_url
@@ -561,16 +584,25 @@ function ci(config, number) {
   const headSha = pr.headRefOid;
   const result = canEnterReview(config, repo, repo.base, headSha);
   if (result.ready) {
-    saveState(config, alias, number, { ciHeadSha: headSha, ciVerifiedAt: new Date().toISOString() });
+    const ciVerifiedAt = new Date().toISOString();
+    saveState(config, alias, number, { ciHeadSha: headSha, ciVerifiedAt });
     setStatus(config, number, 'in-review');
     setNeed(config, number, 'reviewer');
-    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。${auditFooter(config, 'ci')}`]);
+    const note = `CI 门禁通过：Required Checks 全绿，绑定 HEAD \`${headSha.slice(0, 12)}\`。\n\n进入 in-review，等待 Reviewer。`;
+    const body = stateComment(config, 'ci', {
+      issue: number, alias, type: 'ci',
+      payload: { ready: true, ciHeadSha: headSha, ciVerifiedAt, required: result.required },
+    }, note);
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
     console.log(`#${number} -> in-review（CI 全绿，ciHeadSha=${headSha.slice(0, 8)}）`);
   } else {
     setNeed(config, number, 'author');
-    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}${auditFooter(config, 'ci')}`]);
+    const note = `CI 门禁未通过（HEAD \`${headSha.slice(0, 12)}\`，fail-closed）：\n\n${result.missing.map((m) => `- ${m}`).join('\n')}`;
+    const body = stateComment(config, 'ci', {
+      issue: number, alias, type: 'ci',
+      payload: { ready: false, required: result.required, missing: result.missing },
+    }, note);
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
     console.log(`#${number} -> need:author（CI 未全绿）`);
   }
 }
@@ -625,22 +657,32 @@ function merge(config, number, flags) {
     const merged = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(pr.number), '-R', repo.github,
       '--json', 'mergeCommit,state']).stdout);
     const mergedSha = merged.mergeCommit?.oid ?? null;
+    const mergedAt = new Date().toISOString();
     saveState(config, alias, number, {
-      mergedSha, mergedAt: new Date().toISOString(),
+      mergedSha, mergedAt,
       mergeVerdict: 'merge', mergeLgtm: lgtm.review_id,
     });
     setStatus(config, number, 'verifying');
     setNeed(config, number, 'issue-owner');
-    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}${auditFooter(config, 'merge')}`]);
+    const note = `Repo Owner 合并：PR #${pr.number}，四门重检通过。\n\n- HEAD：\`${headSha.slice(0, 12)}\`\n- merge：\`${(mergedSha ?? '').slice(0, 12)}\`\n- LGTM（reviewer）：${lgtm.review_id}`;
+    const body = stateComment(config, 'merge', {
+      issue: number, alias, type: 'merge',
+      payload: { mergedSha, mergedAt, mergeVerdict: 'merge', mergeLgtm: lgtm.review_id },
+    }, note);
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
     console.log(`#${number} merged -> verifying`);
   } else {
     const reason = failures.length ? failures.join('；') : (flags.reason || 'Repo Owner 退回');
-    saveState(config, alias, number, { mergeVerdict: 'rework', reworkAt: new Date().toISOString(), reworkReason: reason });
+    const reworkAt = new Date().toISOString();
+    saveState(config, alias, number, { mergeVerdict: 'rework', reworkAt, reworkReason: reason });
     setStatus(config, number, 'in-progress');
     setNeed(config, number, 'author');
-    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository,
-      '--body', `Repo Owner 退回（rework）：\n\n${reason}${auditFooter(config, 'merge')}`]);
+    const note = `Repo Owner 退回（rework）：\n\n${reason}`;
+    const body = stateComment(config, 'merge', {
+      issue: number, alias, type: 'merge',
+      payload: { mergeVerdict: 'rework', reworkAt, reworkReason: reason },
+    }, note);
+    controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
     console.log(`#${number} -> in-progress（rework）`);
   }
 }
@@ -659,9 +701,14 @@ function verifyInternal(config, number, flags) {
   const item = issue(config, number);
   if (!labelsOf(item).includes('review:lgtm')) fail(`#${number} 尚无独立 review:lgtm。`);
   assertSingleAssignee(item);   // 决策④
-  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
+  const alias = repoAliasOf(item, config);
+  detectOwnerTransfer(config, alias, number, item);
+  const payload = ownerTransferSnapshot(config, alias, number);
   const evidence = fs.readFileSync(evidencePath, 'utf8');
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 合并后验证\n\n${evidence}${auditFooter(config, 'verify')}`]);
+  const body = stateComment(config, 'verify', {
+    issue: number, alias, type: 'owner-transfer', payload,
+  }, `## 合并后验证\n\n${evidence}`);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
   setStatus(config, number, 'verified');
   setNeed(config, number, 'issue-owner');
   console.log(`#${number} -> verified`);
@@ -681,12 +728,63 @@ function closeInternal(config, number, flags) {
   const item = issue(config, number);
   if (!labelsOf(item).includes('status:verified')) fail(`#${number} 尚未完成 verified Gate。`);
   assertSingleAssignee(item);   // 决策④
-  detectOwnerTransfer(config, repoAliasOf(item, config), number, item);
+  const alias = repoAliasOf(item, config);
+  detectOwnerTransfer(config, alias, number, item);
+  const payload = ownerTransferSnapshot(config, alias, number);
   const summary = fs.readFileSync(summaryPath, 'utf8');
-  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', `## 总结\n\n${summary}${auditFooter(config, 'close')}`]);
+  const body = stateComment(config, 'close', {
+    issue: number, alias, type: 'owner-transfer', payload,
+  }, `## 总结\n\n${summary}`);
+  controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
   setNeed(config, number, null);
   controlGh(['issue', 'close', String(number), '-R', config.issueRepository, '--reason', 'completed']);
   console.log(`#${number} closed`);
+}
+
+// ---------------------------------------------------------------------------
+// State rebuild（issue-pilot#122）：从 Issue 评论状态块恢复本地 state
+// ---------------------------------------------------------------------------
+
+function stateRebuild(config, number, flags) {
+  const item = issue(config, number);
+  const alias = repoAliasOf(item, config);
+  repoDescriptor(config, alias);
+  const out = controlGh([
+    'api', '--paginate', '--slurp',
+    `repos/${config.issueRepository}/issues/${number}/comments?per_page=100`,
+  ]);
+  let pages;
+  try {
+    pages = JSON.parse(out.stdout);
+  } catch {
+    fail('评论分页解析失败（fail-closed）');
+  }
+  if (!Array.isArray(pages)) fail('评论分页结构非法（fail-closed）');
+  const comments = pages.flat();
+  const events = parseStateComments(comments, {
+    issue: number,
+    repository: config.issueRepository,
+    alias,
+  });
+  const folded = foldStateEvents(events);
+  const summary = stateRebuildSummary(number, alias, events, folded);
+  if (flags['dry-run']) {
+    console.log(summary);
+    return;
+  }
+  atomicWriteJson(statePath(config, alias, number), {
+    ...folded,
+    schemaVersion: STATE_SCHEMA,
+    rebuiltAt: new Date().toISOString(),
+    rebuiltFrom: 'issue-comments',
+    rebuiltEvents: events.length,
+  });
+  console.log(summary);
+}
+
+function stateCommand(config, positionals, flags) {
+  if (positionals[0] !== 'rebuild') fail('state 只支持 rebuild <issue> [--dry-run]。');
+  stateRebuild(config, requireNumber(positionals[1]), flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1075,7 @@ try {
     else if (command === 'submit') submit(config, requireNumber(positionals[0]));
     else if (command === 'bind') bind(config, requireNumber(positionals[0]), flags);
     else if (command === 'ci') ci(config, requireNumber(positionals[0]));
+    else if (command === 'state') stateCommand(config, positionals, flags);
     else if (command === 'review') review(config, requireNumber(positionals[0]), flags);
     else if (command === 'merge') merge(config, requireNumber(positionals[0]), flags);
     else if (command === 'verify') verify(config, requireNumber(positionals[0]), flags);
