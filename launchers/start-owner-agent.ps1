@@ -63,15 +63,21 @@ $hostsYml = Join-Path $GhDir 'hosts.yml'
 if (-not (Test-Path $hostsYml)) {
   Set-Content -LiteralPath $hostsYml -Value "# pl-$Role : intentionally empty - no stored GitHub credentials" -Encoding ASCII
 }
-if (-not (Test-Path $GitConfig)) {
-  @"
+try {
+  . (Join-Path $PSScriptRoot 'lib-proxy.ps1')
+  $gitProxy = Resolve-LauncherGitProxy -Role $Role
+} catch { Abort $_.Exception.Message }
+@"
 [credential]
-	helper =
+  helper =
 [credential "https://github.com"]
-	helper =
+  helper =
 [http]
-	sslVerify = true
+  sslVerify = true
 "@ | Set-Content -LiteralPath $GitConfig -Encoding ASCII
+if ($gitProxy) {
+  & git config --file $GitConfig http.proxy $gitProxy 2>$null
+  if ($LASTEXITCODE -ne 0) { Abort "failed to write isolated Git proxy config" }
 }
 if (-not (Test-Path $AskPass)) {
   @"
