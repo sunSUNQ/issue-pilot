@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -552,15 +553,19 @@ export function writeAudit(config, operation, env = process.env, opts = {}) {
   };
 }
 
-// Markdown footer appended to every control-repo operation comment (audit trail).
-export function auditFooter(config, operation, env = process.env, opts = {}) {
-  const a = writeAudit(config, operation, env, opts);
+// Markdown footer built from an already-verified audit record.
+export function auditFooterFrom(audit) {
   return [
     '',
     '---',
     '<sub>control-plane audit</sub>',
-    `role=\`${a.role}\` principal=\`${a.principal}\` writer_login=\`${a.writer_login}\` repository=\`${a.repository}\` operation=\`${a.operation}\``,
+    `role=\`${audit.role}\` principal=\`${audit.principal}\` writer_login=\`${audit.writer_login}\` repository=\`${audit.repository}\` operation=\`${audit.operation}\``,
   ].join('\n');
+}
+
+// Markdown footer appended to every control-repo operation comment (audit trail).
+export function auditFooter(config, operation, env = process.env, opts = {}) {
+  return auditFooterFrom(writeAudit(config, operation, env, opts));
 }
 
 // Assert the CLI was not handed an external --role/--principal override.
@@ -803,6 +808,357 @@ export function saveState(config, alias, number, patch) {
   const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
   fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
   return next;
+}
+
+// ---------------------------------------------------------------------------
+// Governance state blocks + rebuild (issue-pilot#122, design v1)
+// ---------------------------------------------------------------------------
+
+export const STATE_SCHEMA = 'issue-pilot/state@1';
+export const STATE_TYPES = new Set(['binding', 'ci', 'review', 'merge', 'run', 'owner-transfer', 'verify']);
+const STATE_BLOCK_LINE_RE = /^<!-- issue-pilot-state:v1 ([A-Za-z0-9+/=]+) -->\r?$/;
+const STATE_HASH_RE = /^sha256:[0-9a-f]{64}$/;
+const FOOTER_FIELDS_RE = /role=`([^`]+)` principal=`([^`]+)` writer_login=`([^`]+)` repository=`([^`]+)` operation=`([^`]+)`/g;
+
+export function sha256Hex(text) {
+  return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+}
+
+function stripUndefined(value) {
+  if (Array.isArray(value)) return value.map(stripUndefined);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (item !== undefined) out[key] = stripUndefined(item);
+    }
+    return out;
+  }
+  return value;
+}
+
+// Deterministic JSON: recursively sorted keys, no insignificant whitespace.
+export function canonicalJson(value) {
+  if (value === null) return 'null';
+  const type = typeof value;
+  if (type === 'number') {
+    if (!Number.isFinite(value)) fail('canonicalJson: NaN/Infinity 不允许');
+    return JSON.stringify(value);
+  }
+  if (type === 'string' || type === 'boolean') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
+  if (type === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  fail(`canonicalJson: 不支持的类型 ${type}`);
+}
+
+export function extractStateBlocks(body) {
+  const blocks = [];
+  for (const line of String(body ?? '').split(/\r?\n/)) {
+    const match = STATE_BLOCK_LINE_RE.exec(line);
+    if (match) blocks.push(match[1]);
+  }
+  return blocks;
+}
+
+export function removeStateBlockLines(body) {
+  return String(body ?? '')
+    .split(/\r?\n/)
+    .filter((line) => !STATE_BLOCK_LINE_RE.test(line))
+    .join('\n');
+}
+
+export function normalizeBodyForHash(body) {
+  const lines = removeStateBlockLines(body)
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/, ''));
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines.length ? `${lines.join('\n')}\n` : '';
+}
+
+export function encodeStateBlock(envelope) {
+  const payload = Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64');
+  return `<!-- issue-pilot-state:v1 ${payload} -->`;
+}
+
+export function appendStateBlock(visibleBody, envelope) {
+  return `${String(visibleBody).replace(/\s+$/, '')}\n\n${encodeStateBlock(envelope)}\n`;
+}
+
+// Build the envelope. `meta` carries issue/alias/type/payload + the verified
+// audit identity. body_sha256 covers the visible body (including audit footer)
+// with the state block removed.
+export function makeStateEnvelope(meta, visibleBody, at = new Date().toISOString()) {
+  const payload = stripUndefined(meta.payload ?? {});
+  const base = {
+    schema: STATE_SCHEMA,
+    issue: meta.issue,
+    repository: meta.repository,
+    alias: meta.alias,
+    type: meta.type,
+    operation: meta.operation,
+    role: meta.role,
+    principal: meta.principal,
+    writer_login: meta.writer_login,
+    at,
+    payload,
+  };
+  return {
+    schema: STATE_SCHEMA,
+    event_id: `sha256:${sha256Hex(canonicalJson(base))}`,
+    issue: base.issue,
+    repository: base.repository,
+    alias: base.alias,
+    type: base.type,
+    operation: base.operation,
+    role: base.role,
+    principal: base.principal,
+    writer_login: base.writer_login,
+    at: base.at,
+    body_sha256: `sha256:${sha256Hex(normalizeBodyForHash(visibleBody))}`,
+    payload,
+  };
+}
+
+// Full comment body for a state-bearing control-plane write: visible text +
+// existing audit footer + hidden state block. Verifies the launcher identity
+// once (via writeAudit).
+export function stateComment(config, operation, meta, body, env = process.env, opts = {}) {
+  const audit = writeAudit(config, operation, env, opts);
+  const visible = `${body}${auditFooterFrom(audit)}`;
+  const envelope = makeStateEnvelope({
+    issue: meta.issue,
+    repository: audit.repository,
+    alias: meta.alias,
+    type: meta.type,
+    operation,
+    role: audit.role,
+    principal: audit.principal,
+    writer_login: audit.writer_login,
+    payload: meta.payload,
+  }, visible);
+  return appendStateBlock(visible, envelope);
+}
+
+function normalizeBotLogin(login) {
+  if (typeof login !== 'string') return '';
+  const stripped = login.replace(/^app\//, '');
+  return stripped.endsWith('[bot]') ? stripped : `${stripped}[bot]`;
+}
+
+// Validate one comment: author pinning, footer cross-check, body_sha256 and
+// event_id. Returns null for legacy comments (no block), throws fail-closed
+// for malformed/forged blocks.
+export function validateStateComment(comment, context) {
+  const body = String(comment.body ?? '');
+  const blocks = extractStateBlocks(body);
+  if (blocks.length === 0) return null;
+  if (blocks.length > 1) fail(`评论 ${comment.id} 含 ${blocks.length} 个状态块（fail-closed）`);
+
+  const decoded = Buffer.from(blocks[0], 'base64');
+  if (decoded.toString('base64') !== blocks[0]) fail(`评论 ${comment.id} 状态块 Base64 非规范编码（fail-closed）`);
+  let envelope;
+  try {
+    envelope = JSON.parse(decoded.toString('utf8'));
+  } catch {
+    fail(`评论 ${comment.id} 状态块 JSON 非法（fail-closed）`);
+  }
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    fail(`评论 ${comment.id} 状态块不是 JSON 对象（fail-closed）`);
+  }
+  if (envelope.schema !== STATE_SCHEMA) fail(`评论 ${comment.id} schema 未知：${envelope.schema}`);
+  if (envelope.issue !== context.issue) fail(`评论 ${comment.id} issue 不匹配`);
+  if (envelope.repository !== context.repository) fail(`评论 ${comment.id} repository 不匹配`);
+  if (envelope.alias !== context.alias) fail(`评论 ${comment.id} alias 不匹配`);
+  if (!STATE_TYPES.has(envelope.type)) fail(`评论 ${comment.id} type 未知：${envelope.type}`);
+  if (typeof envelope.operation !== 'string' || !envelope.operation) fail(`评论 ${comment.id} operation 非法`);
+  if (!Object.prototype.hasOwnProperty.call(ROLE_PRINCIPALS, envelope.role)) fail(`评论 ${comment.id} role 未知：${envelope.role}`);
+  if (envelope.principal !== ROLE_PRINCIPALS[envelope.role]) fail(`评论 ${comment.id} principal 与 role 不符`);
+  if (envelope.writer_login !== ROLE_WRITE_BOTS[envelope.role]) fail(`评论 ${comment.id} writer_login 与 role 不符`);
+  if (typeof envelope.at !== 'string' || !Number.isFinite(Date.parse(envelope.at))) fail(`评论 ${comment.id} at 非法`);
+  if (!envelope.payload || typeof envelope.payload !== 'object' || Array.isArray(envelope.payload)) {
+    fail(`评论 ${comment.id} payload 非法`);
+  }
+  if (!STATE_HASH_RE.test(String(envelope.event_id))) fail(`评论 ${comment.id} event_id 格式非法`);
+  if (!STATE_HASH_RE.test(String(envelope.body_sha256))) fail(`评论 ${comment.id} body_sha256 格式非法`);
+
+  const author = normalizeBotLogin(comment.user?.login);
+  const writeBots = new Set(Object.values(ROLE_WRITE_BOTS));
+  if (!writeBots.has(author)) fail(`评论 ${comment.id} 作者 ${author || '(unknown)'} 不在钉扎写侧 bot 集合（fail-closed）`);
+  if (author !== envelope.writer_login) fail(`评论 ${comment.id} 作者与 writer_login 不一致（fail-closed）`);
+
+  const visible = removeStateBlockLines(body);
+  const footers = [...visible.matchAll(FOOTER_FIELDS_RE)];
+  if (footers.length !== 1) fail(`评论 ${comment.id} 审计 footer 数量=${footers.length}（fail-closed）`);
+  const footer = {
+    role: footers[0][1],
+    principal: footers[0][2],
+    writer_login: footers[0][3],
+    repository: footers[0][4],
+    operation: footers[0][5],
+  };
+  for (const key of ['role', 'principal', 'writer_login', 'repository', 'operation']) {
+    if (footer[key] !== envelope[key]) fail(`评论 ${comment.id} 审计 footer ${key} 不一致（fail-closed）`);
+  }
+
+  const bodyHash = `sha256:${sha256Hex(normalizeBodyForHash(body))}`;
+  if (envelope.body_sha256 !== bodyHash) fail(`评论 ${comment.id} body_sha256 不一致（fail-closed）`);
+
+  const base = {
+    schema: envelope.schema,
+    issue: envelope.issue,
+    repository: envelope.repository,
+    alias: envelope.alias,
+    type: envelope.type,
+    operation: envelope.operation,
+    role: envelope.role,
+    principal: envelope.principal,
+    writer_login: envelope.writer_login,
+    at: envelope.at,
+    payload: envelope.payload,
+  };
+  if (envelope.event_id !== `sha256:${sha256Hex(canonicalJson(base))}`) {
+    fail(`评论 ${comment.id} event_id 不一致（fail-closed）`);
+  }
+  if (!Number.isFinite(Date.parse(comment.created_at ?? ''))) fail(`评论 ${comment.id} created_at 非法（fail-closed）`);
+  return envelope;
+}
+
+// Parse and deterministically order validated events. Duplicate event_id with
+// identical canonical content is idempotent; identical id with different
+// content fails closed.
+export function parseStateComments(comments, context) {
+  const events = [];
+  for (const comment of comments ?? []) {
+    const envelope = validateStateComment(comment, context);
+    if (!envelope) continue;
+    events.push({
+      order: [Date.parse(comment.created_at), Number(comment.id), envelope.event_id],
+      comment_id: comment.id,
+      envelope,
+    });
+  }
+  events.sort((a, b) => a.order[0] - b.order[0] || a.order[1] - b.order[1] || a.order[2].localeCompare(b.order[2]));
+  const seen = new Map();
+  const unique = [];
+  for (const event of events) {
+    const canonical = canonicalJson(event.envelope);
+    if (seen.has(event.envelope.event_id)) {
+      if (seen.get(event.envelope.event_id) !== canonical) {
+        fail(`event_id 冲突（相同 id 不同内容）：${event.envelope.event_id}`);
+      }
+      continue;
+    }
+    seen.set(event.envelope.event_id, canonical);
+    unique.push(event);
+  }
+  return unique;
+}
+
+export function foldStateEvents(events) {
+  const state = {};
+  for (const { envelope } of events) {
+    const payload = envelope.payload ?? {};
+    switch (envelope.type) {
+      case 'binding': {
+        if (!Number.isInteger(payload.prNumber) || payload.prNumber <= 0) fail('binding payload prNumber 非法');
+        state.prNumber = payload.prNumber;
+        if (payload.prUrl !== undefined) state.prUrl = payload.prUrl;
+        if (payload.prBranch !== undefined) {
+          state.prBranch = payload.prBranch;
+          state.branch = payload.prBranch;
+        }
+        if (payload.prBase !== undefined) state.prBase = payload.prBase;
+        if (payload.prHeadSha !== undefined) {
+          state.prHeadSha = payload.prHeadSha;
+          state.head = payload.prHeadSha;
+        }
+        if (payload.boundAt !== undefined) state.boundAt = payload.boundAt;
+        if (payload.boundBy !== undefined) state.boundBy = payload.boundBy;
+        if (payload.boundWriter !== undefined) state.boundWriter = payload.boundWriter;
+        if (payload.submittedAt !== undefined) state.submittedAt = payload.submittedAt;
+        break;
+      }
+      case 'ci':
+        if (payload.ready === true) {
+          if (typeof payload.ciHeadSha !== 'string' || !payload.ciHeadSha) fail('ci ready=true 缺 ciHeadSha');
+          state.ciHeadSha = payload.ciHeadSha;
+          if (payload.ciVerifiedAt !== undefined) state.ciVerifiedAt = payload.ciVerifiedAt;
+        }
+        break;
+      case 'review': {
+        const review = payload.review;
+        if (!review || typeof review !== 'object' || typeof review.review_id !== 'string' || !review.review_id) {
+          fail('review payload 缺 review_id');
+        }
+        if (typeof review.reviewed_head_sha !== 'string' || !review.reviewed_head_sha) {
+          fail('review payload 缺 reviewed_head_sha');
+        }
+        const reviews = Array.isArray(state.reviews) ? [...state.reviews] : [];
+        const index = reviews.findIndex((item) => item.review_id === review.review_id);
+        if (index >= 0) {
+          if (reviews[index].reviewed_head_sha !== review.reviewed_head_sha) {
+            fail(`review_id ${review.review_id} 的 reviewed_head_sha 不一致（fail-closed）`);
+          }
+          reviews[index] = review;
+        } else {
+          reviews.push(review);
+        }
+        state.reviews = reviews;
+        break;
+      }
+      case 'merge':
+        if (payload.mergeVerdict === 'merge') {
+          state.mergedSha = payload.mergedSha ?? null;
+          state.mergedAt = payload.mergedAt;
+          state.mergeVerdict = 'merge';
+          if (payload.mergeLgtm !== undefined) state.mergeLgtm = payload.mergeLgtm;
+        } else if (payload.mergeVerdict === 'rework') {
+          state.mergeVerdict = 'rework';
+          state.reworkAt = payload.reworkAt;
+          state.reworkReason = payload.reworkReason;
+        } else {
+          fail('merge payload mergeVerdict 非法');
+        }
+        break;
+      case 'run':
+        if (payload.launcherRole !== undefined) state.launcherRole = payload.launcherRole;
+        if (payload.githubLogin !== undefined) state.githubLogin = payload.githubLogin;
+        break;
+      case 'owner-transfer':
+        if (payload.assignee !== undefined) state.assignee = payload.assignee;
+        if (payload.ownerTransfers !== undefined) {
+          if (!Array.isArray(payload.ownerTransfers)) fail('owner-transfer ownerTransfers 非数组');
+          state.ownerTransfers = payload.ownerTransfers;
+        }
+        break;
+      case 'verify':
+        if (payload.verifiedAt !== undefined) state.verifiedAt = payload.verifiedAt;
+        break;
+      default:
+        fail(`未知 event type ${envelope.type}`);
+    }
+  }
+  return state;
+}
+
+export function stateRebuildSummary(issue, alias, events, state) {
+  const sha8 = (value) => (typeof value === 'string' && value.length >= 8 ? value.slice(0, 8) : 'none');
+  return `#${issue} rebuilt: events=${events.length} aliases=${alias} binding=${state.prNumber ?? 'none'} ciHeadSha=${sha8(state.ciHeadSha)} reviews=${(state.reviews ?? []).length} mergedSha=${sha8(state.mergedSha)}`;
+}
+
+export function atomicWriteJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+export function ownerTransferSnapshot(config, alias, number) {
+  const state = loadState(config, alias, number);
+  return { assignee: state.assignee ?? null, ownerTransfers: state.ownerTransfers ?? [] };
 }
 
 export const AUTO_ELEMENTS = ['观察证据', '期望行为', '反例或失败条件', '允许修改范围', '验收方式'];

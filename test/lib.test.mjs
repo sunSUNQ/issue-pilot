@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
+  appendStateBlock, atomicWriteJson, canonicalJson, encodeStateBlock, extractStateBlocks,
+  foldStateEvents, makeStateEnvelope, normalizeBodyForHash, parseStateComments, removeStateBlockLines,
+  sha256Hex, stateRebuildSummary, validateStateComment, STATE_SCHEMA,
   assertOwnerIdentity, auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
   isApprovedReleaseGateFile, labelsOf, mintAppToken,
   missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
@@ -769,4 +774,203 @@ test('issue-108 delegated path stays behind Solo Mode + scope gate', async () =>
   // never be wired into the command table.
   assert.ok(/else if \(command === 'approve'\) approve\(/.test(source));
   assert.ok(!/else if \(command === '[a-z]+'\) (approveInternal|verifyInternal|closeInternal)\(/.test(source));
+});
+
+// --- issue-pilot#122: governance state blocks + deterministic rebuild ---
+
+const STATE_REPO = 'sunSUNQ/issue-pilot';
+const STATE_CTX = { issue: 101, repository: STATE_REPO, alias: 'issue-pilot' };
+const STATE_BOTS = {
+  worker: { role: 'worker', principal: 'pl-issue-worker[bot]', writer: 'pl-worker-control-write[bot]' },
+  owner: { role: 'owner', principal: 'sunSUNQ', writer: 'pl-owner-control-write[bot]' },
+  reviewer: { role: 'reviewer', principal: 'pl-issue-reviewer[bot]', writer: 'pl-issue-reviewer-write[bot]' },
+};
+
+function stateFooter(bot, operation) {
+  return ['', '---', '<sub>control-plane audit</sub>',
+    `role=\`${bot.role}\` principal=\`${bot.principal}\` writer_login=\`${bot.writer}\` repository=\`${STATE_REPO}\` operation=\`${operation}\``,
+  ].join('\n');
+}
+
+function stateCommentFixture({
+  role = 'worker', type = 'binding', payload = { prNumber: 1 }, operation = 'bind',
+  body = 'visible body', at = '2026-11-25T00:00:00.000Z', id = 1,
+  createdAt = '2026-11-25T00:00:01Z', alias = 'issue-pilot', issue = 101, withFooter = true,
+} = {}) {
+  const bot = STATE_BOTS[role];
+  const visible = `${body}${withFooter ? stateFooter(bot, operation) : ''}`;
+  const envelope = makeStateEnvelope({
+    issue, repository: STATE_REPO, alias, type, operation,
+    role: bot.role, principal: bot.principal, writer_login: bot.writer, payload,
+  }, visible, at);
+  return {
+    id, created_at: createdAt, user: { login: bot.writer },
+    body: appendStateBlock(visible, envelope), envelope, visible,
+  };
+}
+
+function stateEvent(type, payload, { role = 'worker', at = '2026-11-25T00:00:00.000Z', operation = type } = {}) {
+  const bot = STATE_BOTS[role];
+  const envelope = makeStateEnvelope({
+    issue: 101, repository: STATE_REPO, alias: 'issue-pilot', type, operation,
+    role: bot.role, principal: bot.principal, writer_login: bot.writer, payload,
+  }, `body${stateFooter(bot, operation)}`, at);
+  return { order: [Date.parse(at), 1, envelope.event_id], comment_id: 1, envelope };
+}
+
+test('issue-122 canonicalJson sorts keys and rejects non-finite numbers', () => {
+  assert.equal(canonicalJson({ b: 1, a: [true, null, 'x'] }), '{"a":[true,null,"x"],"b":1}');
+  assert.throws(() => canonicalJson({ x: NaN }), /NaN/);
+  assert.throws(() => canonicalJson({ x: Infinity }), /NaN/);
+});
+
+test('issue-122 extractStateBlocks handles zero / one / multiple blocks', () => {
+  assert.deepEqual(extractStateBlocks('legacy comment'), []);
+  const comment = stateCommentFixture();
+  assert.equal(extractStateBlocks(comment.body).length, 1);
+  assert.equal(extractStateBlocks(`${comment.body}\n\n${encodeStateBlock(comment.envelope)}`).length, 2);
+});
+
+test('issue-122 removeStateBlockLines and normalizeBodyForHash are stable', () => {
+  const comment = stateCommentFixture({ body: 'line  \r\n\r\n' });
+  const visible = removeStateBlockLines(comment.body);
+  assert.ok(!visible.includes('issue-pilot-state'));
+  assert.ok(normalizeBodyForHash(comment.body).endsWith('\n'));
+  assert.ok(!normalizeBodyForHash(comment.body).includes('\r'));
+  assert.equal(comment.envelope.body_sha256, `sha256:${sha256Hex(normalizeBodyForHash(comment.body))}`);
+});
+
+test('issue-122 validateStateComment accepts a valid worker binding comment', () => {
+  const comment = stateCommentFixture();
+  const envelope = validateStateComment(comment, STATE_CTX);
+  assert.equal(envelope.schema, STATE_SCHEMA);
+  assert.equal(envelope.type, 'binding');
+  assert.equal(envelope.writer_login, STATE_BOTS.worker.writer);
+});
+
+test('issue-122 validateStateComment rejects non-pinned authors and writer mismatch', () => {
+  const comment = stateCommentFixture();
+  assert.throws(() => validateStateComment({ ...comment, user: { login: 'sunSUNQ' } }, STATE_CTX), /钉扎写侧 bot/);
+  assert.throws(() => validateStateComment({ ...comment, user: { login: STATE_BOTS.owner.writer } }, STATE_CTX), /writer_login 不一致/);
+});
+
+test('issue-122 validateStateComment rejects footer mismatch and body tampering', () => {
+  const comment = stateCommentFixture();
+  assert.throws(
+    () => validateStateComment({ ...comment, body: comment.body.replace('operation=`bind`', 'operation=`ci`') }, STATE_CTX),
+    /footer/,
+  );
+  assert.throws(
+    () => validateStateComment({ ...comment, body: comment.body.replace('visible body', 'visible BODY') }, STATE_CTX),
+    /body_sha256/,
+  );
+});
+
+test('issue-122 validateStateComment rejects schema / event_id tampering and multiple blocks', () => {
+  const comment = stateCommentFixture();
+  const badSchema = { ...comment.envelope, schema: 'issue-pilot/state@2' };
+  const badSchemaBody = comment.body.replace(encodeStateBlock(comment.envelope), encodeStateBlock(badSchema));
+  assert.throws(() => validateStateComment({ ...comment, body: badSchemaBody }, STATE_CTX), /schema/);
+
+  const badEvent = { ...comment.envelope, event_id: `sha256:${'0'.repeat(64)}` };
+  const badEventBody = comment.body.replace(encodeStateBlock(comment.envelope), encodeStateBlock(badEvent));
+  assert.throws(() => validateStateComment({ ...comment, body: badEventBody }, STATE_CTX), /event_id/);
+
+  const twoBlocks = `${comment.body}\n\n${encodeStateBlock(comment.envelope)}`;
+  assert.throws(() => validateStateComment({ ...comment, body: twoBlocks }, STATE_CTX), /个状态块/);
+});
+
+test('issue-122 validateStateComment rejects invalid base64/JSON and missing footer', () => {
+  const invalidJson = {
+    id: 1, created_at: '2026-11-25T00:00:01Z', user: { login: STATE_BOTS.worker.writer },
+    body: `visible${stateFooter(STATE_BOTS.worker, 'bind')}\n\n<!-- issue-pilot-state:v1 YWJj -->\n`,
+  };
+  assert.throws(() => validateStateComment(invalidJson, STATE_CTX), /JSON/);
+
+  const noFooter = stateCommentFixture({ withFooter: false });
+  assert.throws(() => validateStateComment(noFooter, STATE_CTX), /footer/);
+});
+
+test('issue-122 parseStateComments orders by created_at/id and dedupes identical events', () => {
+  const first = stateCommentFixture({ id: 2, createdAt: '2026-11-25T00:00:01Z', payload: { prNumber: 1 } });
+  const second = stateCommentFixture({ id: 3, createdAt: '2026-11-25T00:00:02Z', payload: { prNumber: 2 } });
+  const events = parseStateComments([second, first], STATE_CTX);
+  assert.deepEqual(events.map((event) => event.envelope.payload.prNumber), [1, 2]);
+
+  const duplicate = { ...first, id: 4, created_at: '2026-11-25T00:00:03Z' };
+  assert.equal(parseStateComments([first, duplicate], STATE_CTX).length, 1);
+  assert.deepEqual(parseStateComments([{ body: 'legacy', id: 5, created_at: '2026-11-25T00:00:04Z', user: { login: 'sunSUNQ' } }], STATE_CTX), []);
+});
+
+test('issue-122 foldStateEvents: binding latest wins and ci only writes on ready=true', () => {
+  const state = foldStateEvents([
+    stateEvent('binding', { prNumber: 1, prHeadSha: 'a'.repeat(40), prBranch: 'one', prBase: 'main' }),
+    stateEvent('binding', { prNumber: 2, prHeadSha: 'b'.repeat(40), prBranch: 'two', prBase: 'main' }),
+    stateEvent('ci', { ready: false, missing: ['contract'] }),
+    stateEvent('ci', { ready: true, ciHeadSha: 'b'.repeat(40), ciVerifiedAt: '2026-11-25T00:00:02Z' }),
+  ]);
+  assert.equal(state.prNumber, 2);
+  assert.equal(state.prHeadSha, 'b'.repeat(40));
+  assert.equal(state.prBranch, 'two');
+  assert.equal(state.branch, 'two');
+  assert.equal(state.ciHeadSha, 'b'.repeat(40));
+});
+
+test('issue-122 foldStateEvents: reviews append/replace and reject same id with different SHA', () => {
+  const r1 = { review_id: 'r1', reviewed_head_sha: 'a'.repeat(40), reviewer_verdict: 'lgtm' };
+  const r1b = { ...r1, reviewer_verdict: 'changes' };
+  const r2 = { review_id: 'r2', reviewed_head_sha: 'a'.repeat(40), reviewer_verdict: 'lgtm' };
+  const state = foldStateEvents([
+    stateEvent('review', { review: r1 }),
+    stateEvent('review', { review: r2 }),
+    stateEvent('review', { review: r1b }),
+  ]);
+  assert.equal(state.reviews.length, 2);
+  assert.equal(state.reviews[0].reviewer_verdict, 'changes');
+  assert.throws(
+    () => foldStateEvents([
+      stateEvent('review', { review: r1 }),
+      stateEvent('review', { review: { ...r1, reviewed_head_sha: 'b'.repeat(40) } }),
+    ]),
+    /reviewed_head_sha 不一致/,
+  );
+});
+
+test('issue-122 foldStateEvents: merge, run, owner-transfer and verify', () => {
+  const state = foldStateEvents([
+    stateEvent('run', { launcherRole: 'worker', githubLogin: 'pl-issue-worker[bot]' }),
+    stateEvent('owner-transfer', { assignee: 'sunSUNQ', ownerTransfers: [] }),
+    stateEvent('merge', { mergedSha: 'c'.repeat(40), mergedAt: '2026-11-25T00:00:03Z', mergeVerdict: 'merge', mergeLgtm: 'r1' }),
+    stateEvent('verify', { verifiedAt: '2026-11-25T00:00:04Z' }),
+  ]);
+  assert.equal(state.launcherRole, 'worker');
+  assert.equal(state.assignee, 'sunSUNQ');
+  assert.equal(state.mergedSha, 'c'.repeat(40));
+  assert.equal(state.mergeVerdict, 'merge');
+  assert.equal(state.verifiedAt, '2026-11-25T00:00:04Z');
+});
+
+test('issue-122 stateRebuildSummary uses the documented format', () => {
+  assert.equal(
+    stateRebuildSummary(101, 'issue-pilot', [{}, {}], {
+      prNumber: 117, ciHeadSha: '1234567890', reviews: [{}], mergedSha: 'abcdef1234',
+    }),
+    '#101 rebuilt: events=2 aliases=issue-pilot binding=117 ciHeadSha=12345678 reviews=1 mergedSha=abcdef12',
+  );
+  assert.equal(
+    stateRebuildSummary(101, 'issue-pilot', [], {}),
+    '#101 rebuilt: events=0 aliases=issue-pilot binding=none ciHeadSha=none reviews=0 mergedSha=none',
+  );
+});
+
+test('issue-122 atomicWriteJson writes atomically and leaves no temp file', () => {
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.tmp-state-test-'));
+  try {
+    const file = path.join(dir, 'state.json');
+    atomicWriteJson(file, { a: 1 });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { a: 1 });
+    assert.equal(fs.readdirSync(dir).filter((name) => name.includes('.tmp-')).length, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
