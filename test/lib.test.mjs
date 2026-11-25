@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
-  auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
+  assertOwnerIdentity, auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
   isApprovedReleaseGateFile, labelsOf, mintAppToken,
   missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
   repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo,
@@ -723,4 +723,50 @@ test('issue-110 control-repo submit refuses before side effects with release-lau
 test('issue-110 product-repo submit is not refused (behavior unchanged)', () => {
   assert.equal(controlRepoSubmitRefusal(repoDescriptor(R3_CFG, 'tasco'), 110, 'issue-pilot/110-fix'), null);
   assert.equal(controlRepoSubmitRefusal(undefined, 110, 'b'), null);
+});
+
+// --- issue-pilot#108: Owner-only direct commands + scope-gated delegation ---
+
+test('issue-108 assertOwnerIdentity accepts an owner launcher session', () => {
+  const id = assertOwnerIdentity(idEnv('owner', 'read-token', 'write-token'), { resolveTokenLogin: ownerResolve });
+  assert.equal(id.role, 'owner');
+  assert.equal(id.principal, 'sunSUNQ');
+  assert.equal(id.writeTokenBot, 'pl-owner-control-write[bot]');
+});
+
+test('issue-108 assertOwnerIdentity rejects a worker launcher (fail-closed)', () => {
+  assert.throws(
+    () => assertOwnerIdentity(idEnv('worker', 'read-token', 'write-token'), { resolveTokenLogin: workerResolve }),
+    /需要 Owner launcher（PL_ROLE=owner），当前 role=worker/,
+  );
+});
+
+test('issue-108 assertOwnerIdentity rejects a reviewer launcher (fail-closed)', () => {
+  assert.throws(
+    () => assertOwnerIdentity(idEnv('reviewer', 'read-token', 'write-token'), { resolveTokenLogin: reviewerResolve }),
+    /需要 Owner launcher（PL_ROLE=owner），当前 role=reviewer/,
+  );
+});
+
+test('issue-108 assertOwnerIdentity fails closed outside a launcher session', () => {
+  assert.throws(
+    () => assertOwnerIdentity({ PL_ENFORCE_APP: '0', PL_ROLE: 'owner' }, { resolveTokenLogin: ownerResolve }),
+    /PL_ENFORCE_APP/,
+  );
+});
+
+test('issue-108 delegated path stays behind Solo Mode + scope gate', async () => {
+  const source = await readFile(new URL('../scripts/cli.mjs', import.meta.url), 'utf8');
+  const advance = source.slice(source.indexOf('function advanceOnce('), source.indexOf('function advance('));
+  assert.ok(advance.includes('requireSolo()'), 'advanceOnce must require an enabled Solo Mode');
+  assert.ok(advance.includes('soloScopeAllows(solo, alias)'), 'advanceOnce must enforce the policy scope');
+  assert.ok(advance.includes('autoVerify(') && advance.includes('autoClose('), 'delegation must stay in advanceOnce');
+  for (const name of ['approveInternal', 'verifyInternal', 'closeInternal']) {
+    const calls = source.match(new RegExp(`${name}\\(`, 'g')) ?? [];
+    assert.ok(calls.length >= 1, `${name} must exist`);
+  }
+  // The direct CLI dispatchers must call the owner gate; the internal names must
+  // never be wired into the command table.
+  assert.ok(/else if \(command === 'approve'\) approve\(/.test(source));
+  assert.ok(!/else if \(command === '[a-z]+'\) (approveInternal|verifyInternal|closeInternal)\(/.test(source));
 });
