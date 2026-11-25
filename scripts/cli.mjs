@@ -5,7 +5,7 @@ import {
   assertNoRoleOverride, assertOwnerIdentity, assertSingleAssignee, atomicWriteJson, auditFooter, bindingRecord,
   controlGh, controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, foldStateEvents,
   isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
-  loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks, ownerTransferSnapshot,
+  loadState, mergeFailureHint, missingAutoElements, missingRequiredChecks, outstandingBlocks, ownerTransferSnapshot,
   planReviewRecord,
   parseArgs, parseStateComments, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
   repoAccess, repoAliasOf, repoDescriptor, resolveProposeRepo, reviewKey,
@@ -650,11 +650,10 @@ function merge(config, number, flags) {
     const mergeCall = repoAccess(config, repo)(['pr', 'merge', String(pr.number), '-R', repo.github, '--merge'],
       { allowFailure: true });
     if (mergeCall.status !== 0) {
-      const hint = repo.isControlRepo
-        ? '控制仓 CLI merge 未获授权（fail-closed）：需 Owner 为 pl-owner-control-write 授予 '
-          + 'Contents:Write / Pull requests:Write 并留 permission readback（见 Issue #101 B2/B4）。'
-        : 'PR merge 失败（fail-closed）。';
-      fail(`${hint}\n${(mergeCall.stderr || mergeCall.stdout || `exit ${mergeCall.status}`).trim()}`);
+      fail(mergeFailureHint(
+        mergeCall.stderr || mergeCall.stdout || `exit ${mergeCall.status}`,
+        { isControlRepo: repo.isControlRepo },
+      ));
     }
     const merged = JSON.parse(repoAccess(config, repo)(['pr', 'view', String(pr.number), '-R', repo.github,
       '--json', 'mergeCommit,state']).stdout);
