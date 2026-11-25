@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  assertNoRoleOverride, assertSingleAssignee, auditFooter, bindingRecord, controlGh,
+  assertNoRoleOverride, assertOwnerIdentity, assertSingleAssignee, auditFooter, bindingRecord, controlGh,
   controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, isApprovedReleaseGateFile,
   issue, labelsOf, loadConfig,
   loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
@@ -198,6 +198,13 @@ function propose(config, flags) {
 }
 
 function approve(config, number) {
+  assertOwnerIdentity(process.env);
+  approveInternal(config, number);
+}
+
+// Delegated path: reachable only from Solo Mode's advanceOnce (enabled + scope
+// checked there). Never dispatch this from a CLI command.
+function approveInternal(config, number) {
   const item = issue(config, number);
   if (item.state !== 'OPEN') fail(`Issue #${number} 不是 OPEN。`);
   assertSingleAssignee(item);   // 决策④：0/多值 assignee 阻止 approve
@@ -639,6 +646,13 @@ function merge(config, number, flags) {
 }
 
 function verify(config, number, flags) {
+  assertOwnerIdentity(process.env);
+  verifyInternal(config, number, flags);
+}
+
+// Delegated path: reachable only from Solo Mode's advanceOnce (enabled + scope
+// checked there). Never dispatch this from a CLI command.
+function verifyInternal(config, number, flags) {
   if (!flags['evidence-file']) fail('verify 需要 --evidence-file。');
   const evidencePath = path.resolve(flags['evidence-file']);
   if (!fs.existsSync(evidencePath)) fail(`验证证据文件不存在：${evidencePath}`);
@@ -654,6 +668,13 @@ function verify(config, number, flags) {
 }
 
 function closeIssue(config, number, flags) {
+  assertOwnerIdentity(process.env);
+  closeInternal(config, number, flags);
+}
+
+// Delegated path: reachable only from Solo Mode's advanceOnce (enabled + scope
+// checked there). Never dispatch this from a CLI command.
+function closeInternal(config, number, flags) {
   if (!flags['summary-file']) fail('close 需要 --summary-file。');
   const summaryPath = path.resolve(flags['summary-file']);
   if (!fs.existsSync(summaryPath)) fail(`总结文件不存在：${summaryPath}`);
@@ -825,7 +846,7 @@ function autoVerify(config, item, alias, repo, state) {
     `- 验证时间：${new Date().toISOString()}`,
   ].join('\n'), 'utf8');
   setStatus(config, number, 'verifying');
-  verify(config, number, { 'evidence-file': evidencePath });
+  verifyInternal(config, number, { 'evidence-file': evidencePath });
   saveState(config, alias, number, {
     mergedSha, prUrl: state.prUrl ?? view.url,
     verifiedAt: new Date().toISOString(),
@@ -846,7 +867,7 @@ function autoClose(config, item, alias) {
     `- 质量门：独立复审 LGTM（SHA 绑定）+ CI 全绿 + Owner Gate 审计 0 命中`,
     `- 审计链：state 文件 ${path.basename(statePath(config, alias, number))} + Issue 评论`,
   ].join('\n'), 'utf8');
-  closeIssue(config, number, { 'summary-file': summaryPath });
+  closeInternal(config, number, { 'summary-file': summaryPath });
   return null;
 }
 

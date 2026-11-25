@@ -525,6 +525,18 @@ export function verifyLauncherIdentity(env = process.env, opts = {}) {
   };
 }
 
+// Owner-only command gate (issue-pilot#108). Direct `approve` / `verify` /
+// `close` must run in an Owner launcher session. Solo Mode uses the explicit
+// *Internal functions in cli.mjs from advanceOnce (solo + scope gated) instead
+// of this gate, so the delegated path never reuses an unchecked entry point.
+export function assertOwnerIdentity(env = process.env, opts = {}) {
+  const identity = verifyLauncherIdentity(env, opts);
+  if (identity.role !== 'owner') {
+    fail(`需要 Owner launcher（PL_ROLE=owner），当前 role=${identity.role}（fail-closed）`);
+  }
+  return identity;
+}
+
 // G11 — control-repo write audit. Every control-repo (config.issueRepository)
 // write must expose the traceable chain role -> principal -> writer_login ->
 // repository -> operation (not just review). Calls verifyLauncherIdentity, so
