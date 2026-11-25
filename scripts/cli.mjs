@@ -3,10 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   assertNoRoleOverride, assertSingleAssignee, auditFooter, bindingRecord, controlGh,
-  detectOwnerTransfer, ensurePathOnD, fail, findPr, isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
+  controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, isApprovedReleaseGateFile,
+  issue, labelsOf, loadConfig,
   loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks,
   parseArgs, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
-  repoAccess, repoAliasOf, repoDescriptor,
+  repoAccess, repoAliasOf, repoDescriptor, resolveProposeRepo,
   requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
   saveState, setNeed, setStatus, slugify, soloMode, soloScopeAllows, statePath,
   validReviewerLgtm, verifyLauncherIdentity, worktreePath,
@@ -175,8 +176,8 @@ function repoCommand(config, positionals, flags) {
 }
 
 function propose(config, flags) {
-  const { repo, type, title } = flags;
-  if (!repo || !config.repositories[repo]) fail('propose 需要已注册的 --repo。');
+  const { type, title } = flags;
+  const repo = resolveProposeRepo(config, flags.repo);
   if (!TYPE_COLORS[type]) fail(`不支持的 --type：${type}`);
   if (!title || !flags['body-file']) fail('propose 需要 --title 和 --body-file。');
   // Issue Owner：assignee = Issue Owner（生命周期负责人），不得用命令执行者
@@ -186,7 +187,7 @@ function propose(config, flags) {
   if (!fs.existsSync(bodyPath)) fail(`正文文件不存在：${bodyPath}`);
   const result = controlGh([
     'issue', 'create', '-R', config.issueRepository, '--title', title,
-    '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo}`,
+    '--body-file', bodyPath, '--label', `status:candidate,type:${type},repo:${repo.alias}`,
     '--assignee', assignee,
   ]);
   const number = Number(result.stdout.match(/issues\/(\d+)/)?.[1] ?? 0);
@@ -235,6 +236,9 @@ function submit(config, number) {
   const item = issue(config, number);
   const alias = repoAliasOf(item, config);
   const repo = repoDescriptor(config, alias);
+  const expectedBranch = `issue-pilot/${number}-${slugify(item.title)}`;
+  const refusal = controlRepoSubmitRefusal(repo, number, expectedBranch);
+  if (refusal) fail(refusal);
   const target = worktreePath(config, alias, number);
   if (!fs.existsSync(target)) fail(`worktree 不存在：${target}`);
   const status = run('git', ['-C', target, 'status', '--porcelain']).stdout;
