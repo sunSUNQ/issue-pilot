@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import {
-  auditFooter, bindingRecord, controlRepoAlias, findPr, isApprovedReleaseGateFile, labelsOf, mintAppToken,
+  auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
+  isApprovedReleaseGateFile, labelsOf, mintAppToken,
   missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
-  repoAliasOf, repoDescriptor, requiredChecksFromRuleset,
+  repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo,
   slugify, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
 
@@ -662,4 +663,40 @@ test('B1 branch inference still fails closed on ambiguous open PRs', () => {
     }),
     /PR 歧义/,
   );
+});
+
+// --- issue-pilot#110: control-repo author path (propose alias + submit precheck) ---
+
+test('issue-110 resolveProposeRepo accepts the control-repo alias without registration', () => {
+  const d = resolveProposeRepo(R3_CFG, 'issue-pilot');
+  assert.equal(d.isControlRepo, true);
+  assert.equal(d.alias, 'issue-pilot');
+  assert.equal(d.github, 'sunSUNQ/issue-pilot');
+});
+
+test('issue-110 resolveProposeRepo keeps registered product repos unchanged', () => {
+  const d = resolveProposeRepo(R3_CFG, 'tasco');
+  assert.equal(d.isControlRepo, false);
+  assert.equal(d.github, 'sunSUNQ/tasco-dev');
+});
+
+test('issue-110 resolveProposeRepo fails closed without an alias or on an unknown alias', () => {
+  assert.throws(() => resolveProposeRepo(R3_CFG, undefined), /--repo/);
+  assert.throws(() => resolveProposeRepo(R3_CFG, ''), /--repo/);
+  assert.throws(() => resolveProposeRepo(R3_CFG, 'nope'), /未注册仓库 nope/);
+});
+
+test('issue-110 control-repo submit refuses before side effects with release-launcher guidance', () => {
+  const msg = controlRepoSubmitRefusal(repoDescriptor(R3_CFG, 'issue-pilot'), 110, 'issue-pilot/110-fix');
+  assert.match(msg, /release launcher/);
+  assert.match(msg, /fail-closed/);
+  assert.match(msg, /未执行任何 git push/);
+  assert.match(msg, /bind 110 --pr <PR_NUMBER>/);
+  assert.match(msg, /issue-pilot\/110-fix/);
+  assert.match(msg, /base `main`/);
+});
+
+test('issue-110 product-repo submit is not refused (behavior unchanged)', () => {
+  assert.equal(controlRepoSubmitRefusal(repoDescriptor(R3_CFG, 'tasco'), 110, 'issue-pilot/110-fix'), null);
+  assert.equal(controlRepoSubmitRefusal(undefined, 110, 'b'), null);
 });
