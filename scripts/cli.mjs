@@ -6,8 +6,9 @@ import {
   controlGh, controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, foldStateEvents,
   isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
   loadState, missingAutoElements, missingRequiredChecks, outstandingBlocks, ownerTransferSnapshot,
+  planReviewRecord,
   parseArgs, parseStateComments, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
-  repoAccess, repoAliasOf, repoDescriptor, resolveProposeRepo,
+  repoAccess, repoAliasOf, repoDescriptor, resolveProposeRepo, reviewKey,
   requireIssueOwner, requiredChecksFromRuleset, root, run, runShell,
   saveState, setNeed, setStatus, slugify, soloMode, soloScopeAllows, stateComment, statePath,
   stateRebuildSummary, STATE_SCHEMA,
@@ -407,6 +408,7 @@ function reviewCommentBody(verdict, record, blockedReason, note) {
     `| reviewed_head_sha | \`${record.reviewed_head_sha ?? '(none)'}\` |`,
     `| reviewed_at | ${record.reviewed_at} |`,
     `| review_id | ${record.review_id} |`,
+    `| review_seq | ${record.review_seq ?? 0} |`,
   ].join('\n');
   const header = verdict === 'lgtm' ? '## 独立 review：LGTM'
     : verdict === 'changes' ? '## 独立 review：CHANGES'
@@ -480,31 +482,31 @@ function review(config, number, flags) {
     review_url: null,
   };
 
-  // 5. 幂等（state 先行；review_id = issue+PR+head_sha+reviewer+verdict）
+  // 5. 幂等：以 (launcher_role, principal, reviewed_head_sha) 的最新记录为准
+  //    （issue-pilot#111）。同 verdict 且评论已存在 → noop；同 verdict 未写
+  //    评论 → resume；verdict 变化 → append（同 review_id 递增 review_seq）。
   const reviews = state.reviews ?? [];
-  const existing = reviews.find((r) => r.review_id === reviewId);
-  if (existing && existing.review_url) {
+  const plan = planReviewRecord(reviews, record);
+  if (plan.action === 'noop') {
     // E26：评论已写、标签可能失败 → 仅补标签，不重复写评论
     applyReviewLabels(config, number, verdict);
-    console.log(`#${number} review 幂等（评论已存在，仅补标签）`);
+    console.log(`#${number} review 幂等（最新 verdict 相同且评论已存在，仅补标签）`);
     return;
   }
 
-  // 6. 写 state 先行（记录 review 记录，review_url 待补）
-  let nextReviews;
-  if (existing) nextReviews = reviews.map((r) => (r.review_id === reviewId ? record : r));
-  else nextReviews = [...reviews, record];
-  saveState(config, alias, number, { reviews: nextReviews });
+  // 6. 写 state 先行（记录 review 记录 / seq，review_url 待补）
+  saveState(config, alias, number, { reviews: plan.reviews });
 
   // 7. 写评论（控制写侧 token）
-  const note = reviewCommentBody(verdict, record, blockedReason, flags.note);
+  const note = reviewCommentBody(verdict, plan.record, blockedReason, flags.note);
   const body = stateComment(config, 'review', {
-    issue: number, alias, type: 'review', payload: { review: record },
+    issue: number, alias, type: 'review', payload: { review: plan.record },
   }, note);
   const commentOut = controlGh(['issue', 'comment', String(number), '-R', config.issueRepository, '--body', body]);
 
-  // 8. 回填 review_url
-  const withUrl = nextReviews.map((r) => (r.review_id === reviewId ? { ...r, review_url: commentOut.stdout } : r));
+  // 8. 回填 review_url（按 review_id + review_seq 精确定位）
+  const writtenKey = reviewKey(plan.record);
+  const withUrl = plan.reviews.map((r) => (reviewKey(r) === writtenKey ? { ...r, review_url: commentOut.stdout } : r));
   saveState(config, alias, number, { reviews: withUrl });
 
   // 9. 派生标签（派生前重读，幂等应用）
