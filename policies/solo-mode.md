@@ -19,7 +19,9 @@
 ## 1. 目标
 
 单人开发（owner = 唯一人类开发者）场景下，普通开发任务由 Agent 自动推进
-至 verified → close；Owner 只参与产品决策、正式研究资格和高风险授权。
+至 merge 门（置 `need:repo-owner` 后停止，**不自动 merge**）；merge 由 Repo
+Owner 执行，之后 verify → close。Owner 参与
+产品决策、正式研究资格和高风险授权。
 保留两道已验证有效的质量门：独立复审、CI 全绿。
 
 ## 2. 状态机（自动流转）
@@ -27,7 +29,8 @@
 ```text
 candidate → approved → in-progress(implementing) → in-review(submitted/reviewing)
           → [review:lgtm] → merging → verifying → verified → closed
-分流：need:owner（gate 拦截 / 决策）· hold（失败超阈值 / 等待授权）· blocked
+分流：need:issue-owner（等待 Issue Owner 决策）· need:repo-owner（等待 Repo
+Owner merge）· hold（失败超阈值 / 等待授权，`status:hold`）· blocked（`status:blocked`）
 ```
 
 标签映射（沿用现有 label，新增 2 个）：
@@ -39,7 +42,7 @@ candidate → approved → in-progress(implementing) → in-review(submitted/rev
 | merging | `status:in-review`（瞬时态，state 文件记录） |
 | verifying | `status:verifying`（新增） |
 | verified / closed | `status:verified` / 关闭 |
-| hold | `status:hold`（新增）+ `need:owner` |
+| hold | `status:hold`（新增）+ `need:issue-owner` |
 
 命令：`advance <issue>`（幂等单步推进）、`autopilot <issue>`（循环推进至
 hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、结果、证据），
@@ -53,7 +56,8 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 2. 去重、复现、实现、测试；commit / push / 创建 PR。
 3. 独立复审派发（`need:reviewer`；由未参与实现的 Agent 或人认领）及
    最多两轮针对性修复（修复仅定向回归，重大修改再扩展测试）。
-4. 自动 merge（见 §5 质量门，全部满足才执行）。
+4. merge 门检查（见 §5 质量门，全部满足后置 `need:repo-owner` 并停止 ——
+   **不自动 merge**；由 Repo Owner 执行 merge）。
 5. 合并后验证、证据归档、verified → close。
 
 ## 4. OWNER_GATE 清单（自动路径必须升级，不得绕过）
@@ -68,7 +72,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
    用户 v1.4 文件变更。
 8. policy / AGENTS.md / 本文件的修改（Agent 不得修改 policy 扩权）。
 
-文件级 gate 检测（自动 merge 前强制）：
+文件级 gate 检测（merge 门前强制）：
 
 | 触碰即升级 | 文件 |
 |---|---|
@@ -78,7 +82,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 | Workflow 授权面 | `.github/workflows/**` 中 diff 触碰 `permissions:`、`secrets`、`on:` 触发器（测试 job/矩阵/artifact 的白名单内修改预授权） |
 | 资格声明 | diff 新增 `QUALIFIED`（大小写敏感）字样于正式文档 |
 
-## 5. 自动合并质量门（全部满足）
+## 5. Merge 门质量检查（全部满足后停止，等待 Repo Owner）
 
 1. PR head == state 文件记录的精确 HEAD。
 2. 该 HEAD 的 CI checks 全部 success（不重跑有效 CI）。
@@ -89,7 +93,9 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 
 ## 6. 保护机制
 
-- main 分支保护由 Owner 启用（现状：**未启用**，404——Owner 待办）。
+- main 由 `provenlattice-main-protection` ruleset 保护（active，要求
+  `test-windows` / `test-linux` / `linux-jdt-verify` 全绿，required approvals 0；
+  merge 由 Repo Owner 执行）。
 - 不 force push；不自动 Release/PyPI；不自动打 tag。
 - 不覆盖本地 main 的 37 个未推送提交与用户 v1.4 文件（只读对账除外）。
 - 未经 Formal 的结果不得标 QUALIFIED（§4 diff 检测）。
@@ -103,7 +109,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 | approve(OWNER_GATE) | ❌→升级 | ❌ | ❌ | ✅ |
 | 实现 / commit / push(分支) / 建 PR | ✅ | ✅ | — | ✅ |
 | 独立复审 | ❌(实现窗口) | ❌ | ✅ | ✅ |
-| merge（§5 门全过） | ✅ | ❌(自身 PR) | ❌ | ✅ |
+| merge（§5 门全过） | ❌（到 merge 门停止，置 need:repo-owner） | ❌(自身 PR) | ❌ | ✅ |
 | merge（gate 命中） | ❌→hold | ❌ | ❌ | ✅ |
 | Release / tag / PyPI | ❌ | ❌ | ❌ | ✅ |
 | policy 修改 | ❌ | ❌ | ❌ | ✅ |
@@ -114,13 +120,13 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 
 | # | Issue | 验证点 |
 |---|---|---|
-| P1 | #8 重载 signature 观察记录 | 自动批准→实现→PR→merge→close 全链 |
+| P1 | #8 重载 signature 观察记录 | 自动批准→实现→PR→merge 门→Repo Owner merge→close 全链 |
 | P2 | #9 stage0 状态行同步 | 无进展停止 + owner 升级（文件不在 base） |
 | P3 | #10 fixture 解析错误反例 | 代码类实现 + 验证器扩展 |
 | P4 | #11 报告数字精确化 | docs-only 修复轮 |
 | P5 | #12 版本号预备 | Owner Gate 拦截（pyproject 命中 → hold） |
 
-验证：自动批准、派发、独立复审、修复重审、CI 门、自动合并、关闭、
+验证：自动批准、派发、独立复审、修复重审、CI 门、merge 门前停止 + Repo Owner merge、关闭、
 gate 拦截、中断恢复。不得降低检查条件换取 PASS。
 
 ## 9. 回滚方案

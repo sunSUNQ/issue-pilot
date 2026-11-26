@@ -24,13 +24,15 @@ Agent evidence
 
 - Node.js >= 22.18
 - Git
-- GitHub CLI `gh`；支持 `gh auth` 或 Git Credential Manager 中已有的 GitHub 登录
+- GitHub CLI `gh`；GitHub 凭据一律经 `launchers/start-{worker,reviewer,owner}-agent.ps1` 注入（App-only、fail-closed、身份钉扎、自动续签），不使用 `gh auth` 或 Git Credential Manager
 - Windows 上存在 `D:\tasco-temp\`；所有 worktree 和临时产物都写 D 盘
 
 不需要安装 npm 依赖。
 
-当 `gh` 自身 token 过期、但 Git push 仍可用时，CLI 会从 Git Credential Manager
-读取当前 GitHub 凭据，仅注入当前 `gh` 子进程；不会打印或写入仓库配置。
+CLI 不从 Git Credential Manager 读取凭据（R16 起已删除 credential fallback）：
+未注入 launcher 凭据的会话执行需要 GitHub 访问的操作时 fail-closed。launcher
+在会话内存中铸造 GitHub App installation token（PEM 只读、token 不落盘不打印；
+过期后重新 dot-source 即续签）。角色/流程简介见 `docs/roles-and-workflow.md`。
 
 ## 首次启用
 
@@ -58,8 +60,10 @@ npm run pilot -- setup
 
 ```powershell
 npm run pilot -- search "telemetry schema"
-npm run pilot -- propose --repo tasco --type bug --title "修复 telemetry schema 漂移" --body-file D:\tasco-temp\issue-pilot\proposal.md
+npm run pilot -- propose --repo tasco --type bug --title "修复 telemetry schema 漂移" --assignee <owner-login> --body-file D:\tasco-temp\issue-pilot\proposal.md
 ```
+
+`--assignee` 必须显式给出 Issue Owner 的人类 GitHub 登录名（`@me` 或 bot 会被 fail-closed 拒绝）。
 
 Issue 初始状态始终为 `status:candidate`。
 
@@ -122,7 +126,12 @@ npm run pilot -- close 12 --summary-file D:\tasco-temp\issue-pilot\summary.md
 | `approve` | Owner 批准开发 |
 | `run` | 创建隔离 worktree 和分支 |
 | `submit` | 执行 checks、push 并创建产品 PR |
+| `bind` | 控制仓 Issue 与 PR 的显式绑定（PR 号 / 分支 / base / HEAD SHA） |
+| `ci` | 幂等 CI 门禁：Required Checks 全绿转 in-review，否则 need:author |
 | `review` | 记录独立 review 结论与 commit |
+| `merge` | Repo Owner 唯一合并门（四门重检 + GitHub 正式 approval） |
+| `advance` | Solo Mode 幂等单步推进（AUTO 清单内） |
+| `autopilot` | Solo Mode 循环推进至 hold / closed / 无进展 |
 | `verify` | 记录合并后的验证证据，进入 verified |
 | `close` | 写入总结并关闭 Issue |
 
