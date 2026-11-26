@@ -190,7 +190,7 @@ export function repoAliasOf(issue, config) {
   const label = labels.find((item) => item.startsWith('repo:'));
   if (!label) fail(`Issue #${issue.number} 缺少 repo:<alias> label。`);
   const alias = label.slice(5);
-  if (!config.repositories[alias] && alias !== controlRepoAlias(config)) {
+  if (!config.repositories[alias] && alias.toLowerCase() !== controlRepoAlias(config).toLowerCase()) {
     fail(`repos.local.json 未注册仓库 ${alias}。`);
   }
   return alias;
@@ -208,11 +208,36 @@ export function controlRepoAlias(config) {
   return (config.issueRepository ?? '').split('/').pop() ?? '';
 }
 
-// Resolve a repo alias to a descriptor. Product repos come from
-// config.repositories (registered aliases win, unchanged). The control repo is
-// synthesized (isControlRepo=true) when the alias matches controlRepoAlias.
-// Unknown aliases still fail closed.
+// Normalize a GitHub repository identity for comparison (trim + lowercase,
+// whole `owner/repo`). Control-repo identity checks MUST use this instead of
+// raw string equality (issue #132).
+export function normalizeGhIdentity(identity) {
+  return (identity ?? '').trim().toLowerCase();
+}
+
+// Resolve a repo alias to a descriptor. CONTROL IDENTITY WINS (#132): an alias
+// is the control repo when it matches controlRepoAlias(config) (case-
+// insensitive) OR when its registered github identity matches
+// config.issueRepository after normalization. Local registration never
+// overrides control identity — the synthesized control descriptor is returned
+// wholesale. Product repos are unchanged; unknown aliases fail closed.
 export function repoDescriptor(config, alias) {
+  const controlAlias = controlRepoAlias(config).toLowerCase();
+  const controlIdentity = normalizeGhIdentity(config.issueRepository);
+  const isControl =
+    (alias && alias.toLowerCase() === controlAlias) ||
+    normalizeGhIdentity(config.repositories[alias]?.github) === controlIdentity;
+  if (isControl) {
+    return {
+      alias,
+      isControlRepo: true,
+      github: config.issueRepository,
+      base: 'main',
+      policy: 'governance-v2',
+      checks: [],
+      path: root,
+    };
+  }
   const product = config.repositories[alias];
   if (product) {
     return {
@@ -223,17 +248,6 @@ export function repoDescriptor(config, alias) {
       policy: product.policy ?? alias,
       checks: product.checks ?? [],
       path: product.path,
-    };
-  }
-  if (alias && alias === controlRepoAlias(config)) {
-    return {
-      alias,
-      isControlRepo: true,
-      github: config.issueRepository,
-      base: 'main',
-      policy: 'governance-v2',
-      checks: [],
-      path: root,
     };
   }
   fail(`repos.local.json 未注册仓库 ${alias}。`);
