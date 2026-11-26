@@ -8,7 +8,7 @@ import {
   foldStateEvents, makeStateEnvelope, normalizeBodyForHash, parseStateComments, removeStateBlockLines,
   sha256Hex, stateRebuildSummary, validateStateComment, STATE_SCHEMA,
   assertOwnerIdentity, auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
-  isApprovedReleaseGateFile, labelsOf, mergeFailureHint, mintAppToken,
+  isApprovedReleaseGateFile, issueSchemaViolations, labelsOf, mergeFailureHint, mintAppToken,
   missingRequiredChecks, normalizeGhIdentity, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
   repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo, planReviewRecord, reviewKey,
   slugify, soloMode, soloScopeAllows, parseSoloScope, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
@@ -28,6 +28,29 @@ test('slugify produces bounded branch-safe names', () => {
 
 test('labelsOf accepts GitHub label objects', () => {
   assert.deepEqual(labelsOf({ labels: [{ name: 'status:approved' }, { name: 'repo:tasco' }] }), ['status:approved', 'repo:tasco']);
+});
+
+test('issueSchemaViolations accepts a healthy open Issue', () => {
+  const item = { number: 114, assignees: [{ login: 'sunSUNQ' }], labels: [
+    'status:approved', 'type:maintenance', 'repo:issue-pilot', 'need:author',
+  ] };
+  assert.deepEqual(issueSchemaViolations(item, { repositories: { 'issue-pilot': {} } }), []);
+});
+
+test('issueSchemaViolations reports routing and label anomalies', () => {
+  const base = { number: 114, assignees: [{ login: 'sunSUNQ' }], labels: [
+    'status:approved', 'type:maintenance', 'repo:issue-pilot', 'need:author',
+  ] };
+  const check = (changes) => issueSchemaViolations({ ...base, ...changes }, { issueRepository: 'sunSUNQ/issue-pilot' }).join('\n');
+  assert.match(check({ assignees: [] }), /assignee 数量为 0/);
+  assert.match(check({ assignees: [{ login: 'a' }, { login: 'b' }] }), /assignee 数量为 2/);
+  assert.match(check({ labels: base.labels.slice(0, 3) }), /need: 标签数量为 0/);
+  assert.match(check({ labels: [...base.labels, 'need:reviewer'] }), /need: 标签数量为 2/);
+  assert.match(check({ labels: [...base.labels.slice(0, 3), 'need:owner'] }), /非法标签 need:owner/);
+  for (const prefix of ['status:', 'type:', 'repo:']) {
+    assert.match(check({ labels: base.labels.filter((label) => !label.startsWith(prefix)) }), new RegExp(`${prefix} 标签数量为 0`));
+  }
+  assert.match(check({ assignees: [], labels: [...base.labels.slice(0, 3), 'need:issue-owner'] }), /gh issue edit 114/);
 });
 
 // ---- issue #132: control-repo identity wins over local registration ----

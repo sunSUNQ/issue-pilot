@@ -169,6 +169,30 @@ export function labelsOf(issue) {
   return (issue.labels ?? []).map((label) => typeof label === 'string' ? label : label.name);
 }
 
+export function issueSchemaViolations(issue, config = {}) {
+  const labels = labelsOf(issue);
+  const violations = [];
+  const assignees = issue.assignees ?? [];
+  if (assignees.length !== 1) violations.push(`assignee 数量为 ${assignees.length}（应为 1）`);
+  for (const [prefix, allowed] of [
+    ['need:', new Set(['need:author', 'need:reviewer', 'need:issue-owner', 'need:repo-owner'])],
+    ['status:', null], ['type:', null], ['repo:', null],
+  ]) {
+    const found = labels.filter((label) => label.startsWith(prefix));
+    if (found.length !== 1) violations.push(`${prefix} 标签数量为 ${found.length}（应为 1）`);
+    if (allowed) for (const label of found) if (!allowed.has(label)) violations.push(`非法标签 ${label}`);
+  }
+  if (config.repositories) {
+    for (const label of labels.filter((name) => name.startsWith('repo:'))) {
+      if (!config.repositories[label.slice(5)]) violations.push(`未注册仓库标签 ${label}`);
+    }
+  }
+  if (!assignees.length && labels.some((label) => ['need:issue-owner', 'need:repo-owner'].includes(label))) {
+    violations.push(`先设置 assignee：gh issue edit ${issue.number} -R ${config.issueRepository ?? 'OWNER/REPO'} --add-assignee LOGIN`);
+  }
+  return violations;
+}
+
 // Owner-authorized exception for issue-pilot#101 / PR #103 only.
 const GOVERNANCE_V2_RELEASE_DOCS = new Set([
   'policies/governance-v2/acceptance-matrix.md',

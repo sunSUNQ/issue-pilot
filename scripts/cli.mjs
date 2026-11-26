@@ -4,7 +4,7 @@ import path from 'node:path';
 import {
   assertNoRoleOverride, assertOwnerIdentity, assertSingleAssignee, atomicWriteJson, auditFooter, bindingRecord,
   controlGh, controlRepoSubmitRefusal, detectOwnerTransfer, ensurePathOnD, fail, findPr, foldStateEvents,
-  isApprovedReleaseGateFile, issue, labelsOf, loadConfig,
+  isApprovedReleaseGateFile, issue, issueSchemaViolations, labelsOf, loadConfig,
   loadState, mergeFailureHint, missingAutoElements, missingRequiredChecks, outstandingBlocks, ownerTransferSnapshot,
   planReviewRecord,
   parseArgs, parseStateComments, PR_JSON_FIELDS, prIdentityViolations, prRepositoryFromUrl, productGh,
@@ -101,7 +101,29 @@ function doctor(config) {
     bad ||= !(exists && git);
   }
   console.log(`worktree root: ${config.worktreeRoot}`);
+  try {
+    const issues = listOpenIssues(config);
+    const violations = printIssueSchemaViolations(issues, config);
+    bad ||= violations > 0;
+  } catch (error) {
+    console.log(`FAIL open Issue schema check: ${error.message}`);
+    bad = true;
+  }
   if (bad) process.exitCode = 1;
+}
+
+function listOpenIssues(config, mine = false) {
+  const fields = 'number,title,labels,assignees,updatedAt,url,author';
+  const args = ['issue', 'list', '-R', config.issueRepository, '--state', 'open', '--limit', '100', '--json', fields];
+  if (mine) args.push('--assignee', '@me');
+  return JSON.parse(controlGh(args).stdout);
+}
+
+function printIssueSchemaViolations(issues, config) {
+  const entries = issues.flatMap((item) => issueSchemaViolations(item, config).map((message) => `- #${item.number}: ${message}`));
+  console.log(`open Issue schema: ${entries.length} 异常`);
+  if (entries.length) console.log(`## open Issue schema 警告\n${entries.join('\n')}`);
+  return entries.length;
 }
 
 function setup(config) {
@@ -121,10 +143,8 @@ function setup(config) {
 }
 
 function brief(config, mine) {
-  const fields = 'number,title,labels,assignees,updatedAt,url,author';
-  const args = ['issue', 'list', '-R', config.issueRepository, '--state', 'open', '--limit', '100', '--json', fields];
-  if (mine) args.push('--assignee', '@me');
-  const issues = JSON.parse(controlGh(args).stdout);
+  const issues = listOpenIssues(config, mine);
+  printIssueSchemaViolations(issues, config);
   const order = ['need:issue-owner', 'need:repo-owner', 'need:reviewer', 'need:author', 'other'];
   const groups = new Map(order.map((status) => [status, []]));
   for (const item of issues) {
