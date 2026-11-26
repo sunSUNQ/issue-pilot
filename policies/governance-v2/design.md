@@ -150,7 +150,7 @@ candidate
 1. `NEED_COLORS`：`{author, reviewer, owner}` → `{author, reviewer, 'issue-owner', 'repo-owner'}`。
 2. `setup`：创建 `need:issue-owner`、`need:repo-owner`；删除 `need:owner`（一次性）。
 3. `brief`：分组顺序 → `['need:issue-owner','need:repo-owner','need:reviewer','need:author','other']`。
-4. `propose`：`--assignee @me`；`setNeed('issue-owner')`（原 owner）。
+4. `propose`：必须显式 `--assignee <owner-login>`（人类登录名，fail-closed，禁止 bot/`@me`，见 `requireIssueOwner()`）；`setNeed('issue-owner')`（原 owner）。
 5. `approve`：前置 Assignee 唯一性校验（0/多值→阻止）。
 6. `submit`：建 PR → `status:in-progress` + `need:author`（不再直接 `need:reviewer`），评论「等待 CI 门禁」；记录 `prUrl/head/submittedAt`。
 7. **新增 `ci <issue>`**：幂等；`canEnterReview` 全绿→记录 `ciHeadSha` 到 state、`in-review`+`need:reviewer`；否则 `need:author`+失败明细（含 SHA）。

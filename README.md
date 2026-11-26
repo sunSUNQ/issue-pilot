@@ -24,13 +24,15 @@ Agent evidence
 
 - Node.js >= 22.18
 - Git
-- GitHub CLI `gh`；支持 `gh auth` 或 Git Credential Manager 中已有的 GitHub 登录
+- GitHub CLI `gh`；GitHub 凭据一律经 `launchers/start-{worker,reviewer,owner}-agent.ps1` 注入（App-only、fail-closed、身份钉扎、自动续签），不使用 `gh auth` 或 Git Credential Manager
 - Windows 上存在 `D:\tasco-temp\`；所有 worktree 和临时产物都写 D 盘
 
 不需要安装 npm 依赖。
 
-当 `gh` 自身 token 过期、但 Git push 仍可用时，CLI 会从 Git Credential Manager
-读取当前 GitHub 凭据，仅注入当前 `gh` 子进程；不会打印或写入仓库配置。
+CLI 不从 Git Credential Manager 读取凭据（R16 起已删除 credential fallback）：
+未注入 launcher 凭据的会话执行需要 GitHub 访问的操作时 fail-closed。launcher
+在会话内存中铸造 GitHub App installation token（PEM 只读、token 不落盘不打印；
+过期后重新 dot-source 即续签）。角色/流程简介见 `docs/roles-and-workflow.md`。
 
 ## 首次启用
 
