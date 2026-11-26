@@ -9,7 +9,7 @@ import {
   sha256Hex, stateRebuildSummary, validateStateComment, STATE_SCHEMA,
   assertOwnerIdentity, auditFooter, bindingRecord, controlRepoAlias, controlRepoSubmitRefusal, findPr,
   isApprovedReleaseGateFile, labelsOf, mergeFailureHint, mintAppToken,
-  missingRequiredChecks, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
+  missingRequiredChecks, normalizeGhIdentity, outstandingBlocks, parseArgs, prIdentityViolations, prRepositoryFromUrl,
   repoAliasOf, repoDescriptor, requiredChecksFromRuleset, resolveProposeRepo, planReviewRecord, reviewKey,
   slugify, soloMode, soloScopeAllows, parseSoloScope, tokenState, validReviewerLgtm, verifyLauncherIdentity, writeAudit,
 } from '../scripts/lib.mjs';
@@ -28,6 +28,77 @@ test('slugify produces bounded branch-safe names', () => {
 
 test('labelsOf accepts GitHub label objects', () => {
   assert.deepEqual(labelsOf({ labels: [{ name: 'status:approved' }, { name: 'repo:tasco' }] }), ['status:approved', 'repo:tasco']);
+});
+
+// ---- issue #132: control-repo identity wins over local registration ----
+const controlConfig132 = {
+  issueRepository: 'sunSUNQ/issue-pilot',
+  repositories: {
+    'issue-pilot': { path: 'D:/issue-pilot', github: 'sunSUNQ/issue-pilot', base: 'main', policy: 'solo-mode', checks: [] },
+    provenlattice: { path: 'D:/pl', github: 'sunSUNQ/provenlattice', base: 'main', policy: 'codegraph', checks: ['npm test'] },
+  },
+};
+
+test('normalizeGhIdentity trims and lowercases whole owner/repo', () => {
+  assert.equal(normalizeGhIdentity(' sunSUNQ/Issue-Pilot '), 'sunsunq/issue-pilot');
+  assert.equal(normalizeGhIdentity(null), '');
+});
+
+test('repoDescriptor: unregistered control alias still resolves to control repo', () => {
+  const config = { issueRepository: 'sunSUNQ/issue-pilot', repositories: { provenlattice: controlConfig132.repositories.provenlattice } };
+  const d = repoDescriptor(config, 'issue-pilot');
+  assert.equal(d.isControlRepo, true);
+  assert.equal(d.github, 'sunSUNQ/issue-pilot');
+  assert.equal(d.policy, 'governance-v2');
+});
+
+test('repoDescriptor: registered control alias stays control (the #132 bug case)', () => {
+  const d = repoDescriptor(controlConfig132, 'issue-pilot');
+  assert.equal(d.isControlRepo, true);
+  assert.equal(d.github, 'sunSUNQ/issue-pilot');
+  assert.equal(d.base, 'main');
+  assert.equal(d.policy, 'governance-v2');   // registered 'solo-mode' must NOT win
+  assert.deepEqual(d.checks, []);
+});
+
+test('repoDescriptor: registered product repo is unchanged', () => {
+  const d = repoDescriptor(controlConfig132, 'provenlattice');
+  assert.equal(d.isControlRepo, false);
+  assert.equal(d.github, 'sunSUNQ/provenlattice');
+  assert.equal(d.policy, 'codegraph');
+  assert.deepEqual(d.checks, ['npm test']);
+});
+
+test('repoDescriptor: unknown alias fails closed', () => {
+  assert.throws(() => repoDescriptor(controlConfig132, 'nope'), /未注册仓库 nope/);
+});
+
+test('repoDescriptor: identity conflict resolves to control authority', () => {
+  const config = {
+    issueRepository: 'sunSUNQ/issue-pilot',
+    repositories: { ...controlConfig132.repositories, control: { path: 'D:/x', github: 'sunSUNQ/issue-pilot', base: 'dev', policy: 'other', checks: [] } },
+  };
+  const d = repoDescriptor(config, 'control');
+  assert.equal(d.isControlRepo, true);
+  assert.equal(d.github, 'sunSUNQ/issue-pilot');
+  assert.equal(d.base, 'main');               // registered base 'dev' must NOT win
+});
+
+test('repoDescriptor: case/whitespace differences normalize to control', () => {
+  const config = {
+    issueRepository: 'sunSUNQ/issue-pilot',
+    repositories: { ...controlConfig132.repositories, 'weird-alias': { path: 'D:/x', github: ' sunSUNQ/Issue-Pilot ', base: 'main', policy: 'other', checks: [] } },
+  };
+  const d = repoDescriptor(config, 'weird-alias');
+  assert.equal(d.isControlRepo, true);
+  const d2 = repoDescriptor(controlConfig132, 'ISSUE-PILOT');
+  assert.equal(d2.isControlRepo, true);
+});
+
+test('repoAliasOf: control alias comparison is case-insensitive', () => {
+  const issue = { number: 132, labels: [{ name: 'repo:ISSUE-PILOT' }] };
+  assert.equal(repoAliasOf(issue, controlConfig132), 'ISSUE-PILOT');
+  assert.throws(() => repoAliasOf({ number: 1, labels: [{ name: 'repo:nope' }] }, controlConfig132), /未注册仓库 nope/);
 });
 
 test('release gate authorization is exact to PR #103 and six documents', () => {
