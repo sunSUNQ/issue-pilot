@@ -6,7 +6,7 @@
 
 1. **方案先批准**：Agent 提 candidate，Issue Owner 批准后，才能改代码。
 2. **提交要复审**：代码实现完成后，必须由**未参与实现的 Reviewer** 审核；Reviewer 给 LGTM 才进入合并门。
-3. **合入要 Owner**：merge 只能由 **Repo Owner** 执行；GitHub 上的 PR 还需要**正式 approval**（规则集要求），Issue 的 `review:lgtm` 标签不能代替。
+3. **合入要 Owner**：merge 只能由 **Repo Owner** 执行；控制仓（issue-pilot）的 PR 还要求 **1 个 GitHub 正式 approval**（`protect-main` ruleset），产品仓（provenlattice）按 `provenlattice-main-protection` ruleset 只要求 CI 全绿（required approvals 0）；Issue 的 `review:lgtm` 标签不能代替 ruleset 要求。
 
 ## 2. 角色
 
@@ -34,7 +34,7 @@ Agent 提 candidate（五要素 + 查重）
   -> Author 在 D 盘独立 worktree 实现
   -> 提交 PR + CI 全绿
   -> 独立 Reviewer LGTM（need:reviewer -> need:repo-owner）
-  -> Repo Owner 在 GitHub PR 上正式 approval + 执行 merge
+  -> Repo Owner 完成 ruleset 要求（控制仓：1 个正式 approval；产品仓：仅 CI 全绿）并执行 merge
   -> Issue Owner verify（记录合并后证据）
   -> close
 ```
@@ -49,7 +49,8 @@ Agent 提 candidate（五要素 + 查重）
 | 复审通过、待合并 | `status:in-review` + `review:lgtm` | `need:repo-owner` |
 | 合并后验证 | `status:verifying` | `need:issue-owner` |
 | 已验证 | `status:verified` | `need:issue-owner` |
-| 阻塞 / 等决策 | `status:hold` | `need:issue-owner` |
+| Review BLOCKED | 保持 review 流程（status 不变） | `need:reviewer` |
+| Solo hold / 等决策 | `status:hold` | `need:issue-owner` |
 
 每天先看自己的队列：
 
@@ -62,7 +63,7 @@ npm run pilot -- brief
 ## 4. 合入代码的两道门
 
 1. **治理复审门**：独立 Reviewer 在 Issue 中留下 LGTM，绑定当前 PR HEAD SHA；实现者不能自审。
-2. **GitHub 合并门**：`protect-main` ruleset 要求 PR 有 **1 个正式 GitHub PR approval**，CI `contract` 为 success；然后 Repo Owner 执行 merge。
+2. **GitHub 合并门**：控制仓（issue-pilot）由 `protect-main` ruleset 要求 PR 有 **1 个正式 GitHub PR approval** + CI `contract` success；产品仓（provenlattice）由 `provenlattice-main-protection` ruleset 要求 `test-windows` / `test-linux` / `linux-jdt-verify` 全绿（required approvals 0）；然后 Repo Owner 执行 merge。
 
 注意：
 
@@ -76,14 +77,14 @@ npm run pilot -- brief
 - 不在未批准的 Issue 上修改产品代码；一个 Issue 一个 worktree。
 - PR 必须关联控制仓 Issue；过程日志不要写进产品仓库。
 - 不绕过 Hook / CI / ruleset；不修改 policy 来扩大 Agent 自身权限。
-- Agent 不得代替 Owner 执行 approve / merge / close；Owner 的决策权不外包。
+- 直接命令路径下 Agent 不得代替 Owner 执行 approve / merge / close；Solo Mode（ACTIVE 授权）在 AUTO 清单内的 approve/close 为已授权的委托路径，**merge 始终由 Repo Owner 执行**；Owner 的决策权不外包。
 - GitHub 凭据一律经 `launchers/start-{worker,reviewer,owner}-agent.ps1` 注入；不要用个人 token 做控制面写操作。
 - 所有临时文件和 worktree 放在 `D:\tasco-temp\issue-pilot\`。
 
 ## 6. 常见问题
 
 **Q：Reviewer 说 LGTM 了，为什么还不能 merge？**
-A：检查三件事：① GitHub PR 上是否有正式 approval（规则集要求）；② PR HEAD 的 `contract` CI 是否 success；③ Issue 中的 LGTM 是否绑定当前 HEAD SHA。任何一项不满足都不能 merge。
+A：检查四件事：① ruleset 要求是否满足（控制仓：1 个正式 PR approval + `contract` CI；产品仓：`test-windows`/`test-linux`/`linux-jdt-verify` 全绿）；② PR HEAD 的 Required Checks 是否全绿；③ Issue 中的 LGTM 是否绑定当前 HEAD SHA、且无未解决的 CHANGES/BLOCKED；④ `gateAudit` 是否零命中（Owner Gate 文件）。任何一项不满足都不能 merge。
 
 **Q：我是 Author，可以顺手 merge 吗？**
 A：不可以。merge 只限 Repo Owner；Author 也不能 review 自己的 PR。

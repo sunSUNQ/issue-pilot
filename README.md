@@ -60,8 +60,10 @@ npm run pilot -- setup
 
 ```powershell
 npm run pilot -- search "telemetry schema"
-npm run pilot -- propose --repo tasco --type bug --title "修复 telemetry schema 漂移" --body-file D:\tasco-temp\issue-pilot\proposal.md
+npm run pilot -- propose --repo tasco --type bug --title "修复 telemetry schema 漂移" --assignee <owner-login> --body-file D:\tasco-temp\issue-pilot\proposal.md
 ```
+
+`--assignee` 必须显式给出 Issue Owner 的人类 GitHub 登录名（`@me` 或 bot 会被 fail-closed 拒绝）。
 
 Issue 初始状态始终为 `status:candidate`。
 

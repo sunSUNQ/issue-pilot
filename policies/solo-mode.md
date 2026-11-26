@@ -20,7 +20,7 @@
 
 单人开发（owner = 唯一人类开发者）场景下，普通开发任务由 Agent 自动推进
 至 merge 门（置 `need:repo-owner` 后停止，**不自动 merge**）；merge 由 Repo
-Owner 执行（含 GitHub 正式 PR approval），之后 verify → close。Owner 参与
+Owner 执行，之后 verify → close。Owner 参与
 产品决策、正式研究资格和高风险授权。
 保留两道已验证有效的质量门：独立复审、CI 全绿。
 
@@ -57,7 +57,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 3. 独立复审派发（`need:reviewer`；由未参与实现的 Agent 或人认领）及
    最多两轮针对性修复（修复仅定向回归，重大修改再扩展测试）。
 4. merge 门检查（见 §5 质量门，全部满足后置 `need:repo-owner` 并停止 ——
-   **不自动 merge**；由 Repo Owner 执行 merge 与 GitHub 正式 PR approval）。
+   **不自动 merge**；由 Repo Owner 执行 merge）。
 5. 合并后验证、证据归档、verified → close。
 
 ## 4. OWNER_GATE 清单（自动路径必须升级，不得绕过）
@@ -93,7 +93,9 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 
 ## 6. 保护机制
 
-- main 由 `protect-main` ruleset 保护（active，要求 `contract` CI 全绿 + 1 个 GitHub 正式 PR approval；2026-11-24 启用，merge 由 Repo Owner 执行）。
+- main 由 `provenlattice-main-protection` ruleset 保护（active，要求
+  `test-windows` / `test-linux` / `linux-jdt-verify` 全绿，required approvals 0；
+  merge 由 Repo Owner 执行）。
 - 不 force push；不自动 Release/PyPI；不自动打 tag。
 - 不覆盖本地 main 的 37 个未推送提交与用户 v1.4 文件（只读对账除外）。
 - 未经 Formal 的结果不得标 QUALIFIED（§4 diff 检测）。
@@ -118,7 +120,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 
 | # | Issue | 验证点 |
 |---|---|---|
-| P1 | #8 重载 signature 观察记录 | 自动批准→实现→PR→merge→close 全链 |
+| P1 | #8 重载 signature 观察记录 | 自动批准→实现→PR→merge 门→Repo Owner merge→close 全链 |
 | P2 | #9 stage0 状态行同步 | 无进展停止 + owner 升级（文件不在 base） |
 | P3 | #10 fixture 解析错误反例 | 代码类实现 + 验证器扩展 |
 | P4 | #11 报告数字精确化 | docs-only 修复轮 |
