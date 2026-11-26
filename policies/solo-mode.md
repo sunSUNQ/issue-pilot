@@ -107,7 +107,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 | approve(OWNER_GATE) | ❌→升级 | ❌ | ❌ | ✅ |
 | 实现 / commit / push(分支) / 建 PR | ✅ | ✅ | — | ✅ |
 | 独立复审 | ❌(实现窗口) | ❌ | ✅ | ✅ |
-| merge（§5 门全过） | ✅ | ❌(自身 PR) | ❌ | ✅ |
+| merge（§5 门全过） | ❌（到 merge 门停止，置 need:repo-owner） | ❌(自身 PR) | ❌ | ✅ |
 | merge（gate 命中） | ❌→hold | ❌ | ❌ | ✅ |
 | Release / tag / PyPI | ❌ | ❌ | ❌ | ✅ |
 | policy 修改 | ❌ | ❌ | ❌ | ✅ |
@@ -124,7 +124,7 @@ hold/closed/无进展）。每步写 state 文件（操作者、HEAD、依据、
 | P4 | #11 报告数字精确化 | docs-only 修复轮 |
 | P5 | #12 版本号预备 | Owner Gate 拦截（pyproject 命中 → hold） |
 
-验证：自动批准、派发、独立复审、修复重审、CI 门、自动合并、关闭、
+验证：自动批准、派发、独立复审、修复重审、CI 门、merge 门前停止 + Repo Owner merge、关闭、
 gate 拦截、中断恢复。不得降低检查条件换取 PASS。
 
 ## 9. 回滚方案

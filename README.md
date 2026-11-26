@@ -124,7 +124,12 @@ npm run pilot -- close 12 --summary-file D:\tasco-temp\issue-pilot\summary.md
 | `approve` | Owner 批准开发 |
 | `run` | 创建隔离 worktree 和分支 |
 | `submit` | 执行 checks、push 并创建产品 PR |
+| `bind` | 控制仓 Issue 与 PR 的显式绑定（PR 号 / 分支 / base / HEAD SHA） |
+| `ci` | 幂等 CI 门禁：Required Checks 全绿转 in-review，否则 need:author |
 | `review` | 记录独立 review 结论与 commit |
+| `merge` | Repo Owner 唯一合并门（四门重检 + GitHub 正式 approval） |
+| `advance` | Solo Mode 幂等单步推进（AUTO 清单内） |
+| `autopilot` | Solo Mode 循环推进至 hold / closed / 无进展 |
 | `verify` | 记录合并后的验证证据，进入 verified |
 | `close` | 写入总结并关闭 Issue |
 
